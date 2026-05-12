@@ -129,7 +129,7 @@ class SimulationInputs:
     allow_afrr_energy_without_capacity: bool = True
     afrr_certified_capacity_up_mw: float = 0.0
     afrr_certified_capacity_down_mw: float = 0.0
-    # Internal hourly market selection used to block wholesale and gate aFRR energy.
+    # Internal quarter-hour market selection used to block wholesale and gate aFRR energy.
     afrr_capacity_selected_market_h: np.ndarray | None = None
 
     # Curtailment
@@ -170,19 +170,22 @@ def build_combined_soc_with_afrr(
     max_soc_pct: float = 100.0,
 ) -> Dict[str, np.ndarray]:
 
-    wholesale_pv_to_batt_h = np.asarray(result_hourly["pv_to_batt"], dtype=float)
-    wholesale_pv_curtailed_to_batt_h = np.asarray(
-        result_hourly.get("pv_curtailed_to_battery", np.zeros(QH_PER_YEAR)),
-        dtype=float,
+    # The wholesale dispatch is already calculated at 15-minute resolution.
+    # Values are MWh per 15-minute step, so do NOT repeat or divide them again.
+    wholesale_pv_to_batt_qh = _validate_array_length(
+        result_hourly["pv_to_batt"], "PV vers batterie wholesale 15 min", QH_PER_YEAR
     )
-    wholesale_grid_charge_h = np.asarray(result_hourly["grid_charge"], dtype=float)
-    wholesale_discharge_h = np.asarray(result_hourly["discharge"], dtype=float)
-
-    # Convert hourly → quarter-hour
-    wholesale_pv_to_batt_qh = np.repeat(wholesale_pv_to_batt_h / 4.0, 4)
-    wholesale_pv_curtailed_to_batt_qh = np.repeat(wholesale_pv_curtailed_to_batt_h / 4.0, 4)
-    wholesale_grid_charge_qh = np.repeat(wholesale_grid_charge_h / 4.0, 4)
-    wholesale_discharge_market_qh = np.repeat(wholesale_discharge_h / 4.0, 4)
+    wholesale_pv_curtailed_to_batt_qh = _validate_array_length(
+        result_hourly.get("pv_curtailed_to_battery", np.zeros(QH_PER_YEAR)),
+        "PV curtailed vers batterie wholesale 15 min",
+        QH_PER_YEAR,
+    )
+    wholesale_grid_charge_qh = _validate_array_length(
+        result_hourly["grid_charge"], "Charge réseau wholesale 15 min", QH_PER_YEAR
+    )
+    wholesale_discharge_market_qh = _validate_array_length(
+        result_hourly["discharge"], "Décharge wholesale 15 min", QH_PER_YEAR
+    )
 
     if afrr_result is not None:
         afrr_charge_market_qh = np.asarray(afrr_result["afrr_charge_qh_mwh"], dtype=float)
@@ -747,7 +750,7 @@ def build_pure_pv_benchmark(
 
 
 def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
-    pv_sellable = _validate_array_length(inputs.solar_profile, "La production PV nette horaire sellable")
+    pv_sellable = _validate_array_length(inputs.solar_profile, "La production PV nette 15 minutes sellable")
     pv_sellable = np.maximum(pv_sellable, 0.0)
 
     if inputs.curtailed_pv_recoverable_mwh is None:
