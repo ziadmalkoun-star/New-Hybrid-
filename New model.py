@@ -2433,7 +2433,7 @@ def app():
         st.subheader("General Parameters")
         project_lifetime_years = int(st.number_input("Project Lifetime (years)", min_value=1, value=1, step=1))
         grid_export_limit_mw = st.number_input("Grid Injection Limit (MW)", min_value=0.0, value=100.0, step=1.0)
-        soc_steps = st.slider("SOC Steps for Optimization", min_value=21, max_value=201, value=51, step=10)
+        soc_steps = st.slider("SOC Steps for Optimization", min_value=21, max_value=201, value=21, step=10)
 
     bess_degradation_upload = st.file_uploader(
             "BESS Degradation Curve",
