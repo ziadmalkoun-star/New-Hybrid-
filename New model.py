@@ -2560,7 +2560,7 @@ def app():
                 "% of Certified Capacity for aFRR",
                 min_value=0.0,
                 max_value=100.0,
-                value=50.0,
+                value=100.0,
                 step=1.0,
             )
             afrr_capacity_min_price_up = st.number_input(
@@ -2616,10 +2616,10 @@ def app():
             )
 
         with c_afrr2:
-            afrr_min_spread = st.number_input("Spread minimum aFRR net (EUR/MWh)", min_value=0.0, value=0.0, step=1.0)
+            afrr_min_spread = st.number_input("Spread minimum aFRR net (EUR/MWh)", min_value=0.0, value=min_spread_arbitrage, step=1.0)
             afrr_cycle_cost = st.number_input("Coût de cycle aFRR (EUR/MWh)", min_value=0.0, value=float(cycle_cost), step=1.0)
-            afrr_energy_down_activation_pct = st.number_input("aFRR Energy Down Activation (%)", min_value=0.0, max_value=100.0, value=50.0, step=1.0)
-            afrr_energy_up_activation_pct = st.number_input("aFRR Energy Up Activation (%)", min_value=0.0, max_value=100.0, value=50.0, step=1.0)
+            afrr_energy_down_activation_pct = st.number_input("aFRR Energy Down Activation (%)", min_value=0.0, max_value=100.0, value=20.0, step=1.0)
+            afrr_energy_up_activation_pct = st.number_input("aFRR Energy Up Activation (%)", min_value=0.0, max_value=100.0, value=20.0, step=1.0)
 
         with c_afrr3:
             afrr_night_start_hour = st.slider("Début nuit", 0, 23, 20)
