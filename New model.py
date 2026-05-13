@@ -2460,6 +2460,213 @@ def reconcile_wholesale_afrr_dispatch_qh(
     }
 
 
+
+def enforce_hard_annual_cycle_cap_on_reconciliation(
+    reconciliation: Dict[str, np.ndarray],
+    inputs: SimulationInputs,
+    afrr_capacity_result: Dict[str, np.ndarray] | None = None,
+) -> tuple[Dict[str, np.ndarray], Dict[str, int]]:
+    """Enforce max_cycles_per_year as a hard annual discharge budget.
+
+    The existing DP limits wholesale discharge, but final reconciliation can add
+    aFRR UP discharge on top. This pass ranks all final discharge candidates
+    (wholesale and aFRR UP) by net EUR/MWh value, keeps the best candidates
+    within the annual discharge cap, clips the marginal interval if needed, and
+    rejects the rest. It then recomputes revenues, SOC and audit columns.
+    """
+    if reconciliation is None:
+        return reconciliation, {"wholesale_rejected": 0, "afrr_rejected": 0}
+
+    out: Dict[str, np.ndarray] = {}
+    for key, value in reconciliation.items():
+        if isinstance(value, np.ndarray):
+            out[key] = value.copy()
+        else:
+            out[key] = value
+
+    wh = _validate_array_length(out.get("wholesale_discharge_qh_mwh", np.zeros(QH_PER_YEAR)), "Wholesale discharge for cycle cap")
+    afrr = _validate_array_length(out.get("afrr_discharge_qh_mwh", np.zeros(QH_PER_YEAR)), "aFRR discharge for cycle cap")
+    wh_before = wh.copy()
+    afrr_before = afrr.copy()
+
+    annual_cap = max(float(inputs.max_cycles_per_year), 0.0) * float(inputs.batt_energy_mwh)
+    if annual_cap <= 1e-12:
+        keep_wh = np.zeros(QH_PER_YEAR, dtype=float)
+        keep_afrr = np.zeros(QH_PER_YEAR, dtype=float)
+    else:
+        batt_sell = _validate_array_length(inputs.batt_sell_price, "BESS sell price for cycle cap")
+        afrr_sell = _validate_array_length(inputs.afrr_discharge_price_qh if inputs.afrr_discharge_price_qh is not None else np.zeros(QH_PER_YEAR), "aFRR UP price for cycle cap")
+        stored_cost = np.nan_to_num(
+            np.asarray(out.get("stored_energy_cost_eur_per_mwh", np.zeros(QH_PER_YEAR)), dtype=float).reshape(-1)[:QH_PER_YEAR],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if len(stored_cost) != QH_PER_YEAR:
+            stored_cost = np.zeros(QH_PER_YEAR, dtype=float)
+
+        expected_up = np.zeros(QH_PER_YEAR, dtype=float)
+        expected_cap_rev = np.zeros(QH_PER_YEAR, dtype=float)
+        if afrr_capacity_result is not None:
+            expected_up = np.asarray(afrr_capacity_result.get("expected_up_activated_mwh", np.zeros(QH_PER_YEAR)), dtype=float).reshape(-1)
+            expected_cap_rev = np.asarray(afrr_capacity_result.get("expected_up_capacity_revenue_eur", np.zeros(QH_PER_YEAR)), dtype=float).reshape(-1)
+            if len(expected_up) != QH_PER_YEAR:
+                expected_up = np.zeros(QH_PER_YEAR, dtype=float)
+            if len(expected_cap_rev) != QH_PER_YEAR:
+                expected_cap_rev = np.zeros(QH_PER_YEAR, dtype=float)
+        cap_value_per_activated_mwh = np.divide(
+            expected_cap_rev,
+            np.maximum(expected_up, 1e-12),
+            out=np.zeros(QH_PER_YEAR, dtype=float),
+            where=expected_up > 1e-12,
+        )
+
+        cost_per_output = stored_cost / max(inputs.eta_discharge, 1e-12)
+        wh_value = batt_sell - cost_per_output - (float(inputs.cycle_cost_eur_per_mwh) / max(inputs.eta_discharge, 1e-12))
+        afrr_value = afrr_sell + cap_value_per_activated_mwh - cost_per_output - (float(inputs.afrr_cycle_cost_eur_per_mwh) / max(inputs.eta_discharge, 1e-12))
+
+        candidates: list[tuple[float, int, str, float]] = []
+        for t in range(QH_PER_YEAR):
+            if wh[t] > 1e-12:
+                candidates.append((float(wh_value[t]), t, "wholesale", float(wh[t])))
+            if afrr[t] > 1e-12:
+                candidates.append((float(afrr_value[t]), t, "afrr", float(afrr[t])))
+
+        # Highest value first; stable tie-break by time for deterministic results.
+        candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
+        keep_wh = np.zeros(QH_PER_YEAR, dtype=float)
+        keep_afrr = np.zeros(QH_PER_YEAR, dtype=float)
+        remaining = float(annual_cap)
+        for value, t, market, qty in candidates:
+            if remaining <= 1e-9:
+                break
+            kept = min(qty, remaining)
+            if kept <= 1e-12:
+                continue
+            if market == "wholesale":
+                keep_wh[t] += kept
+            else:
+                keep_afrr[t] += kept
+            remaining -= kept
+
+    wh_rejected = np.maximum(wh_before - keep_wh, 0.0)
+    afrr_rejected = np.maximum(afrr_before - keep_afrr, 0.0)
+
+    out["wholesale_discharge_qh_mwh"] = keep_wh
+    out["wholesale_discharge_hourly_mwh"] = keep_wh
+    out["afrr_discharge_qh_mwh"] = keep_afrr
+    out["afrr_discharge_hourly_mwh"] = keep_afrr
+
+    # Remove aFRR UP activation flags where no aFRR discharge remains.
+    if "afrr_energy_up_activated_qh" in out:
+        out["afrr_energy_up_activated_qh"] = (keep_afrr > 1e-12).astype(int)
+    if "afrr_energy_up_activated_hourly" in out:
+        out["afrr_energy_up_activated_hourly"] = (keep_afrr > 1e-12).astype(int)
+
+    # Recompute revenues and SOC after the budget cut. Charges are clipped by
+    # headroom during this SOC replay, so the final trajectory remains feasible.
+    batt_sell = _validate_array_length(inputs.batt_sell_price, "BESS sell price for post cap")
+    grid_buy = _validate_array_length(inputs.grid_buy_price, "Grid buy price for post cap")
+    afrr_charge_price = _validate_array_length(inputs.afrr_charge_price_qh if inputs.afrr_charge_price_qh is not None else np.zeros(QH_PER_YEAR), "aFRR DOWN price for post cap")
+    afrr_discharge_price = _validate_array_length(inputs.afrr_discharge_price_qh if inputs.afrr_discharge_price_qh is not None else np.zeros(QH_PER_YEAR), "aFRR UP price for post cap")
+
+    pv_to_batt = _validate_array_length(out.get("wholesale_pv_to_batt_qh_mwh", np.zeros(QH_PER_YEAR)), "PV to battery post cap")
+    pv_curt_to_batt = _validate_array_length(out.get("wholesale_pv_curtailed_to_batt_qh_mwh", np.zeros(QH_PER_YEAR)), "Curtailed PV to battery post cap")
+    grid_charge = _validate_array_length(out.get("wholesale_grid_charge_qh_mwh", np.zeros(QH_PER_YEAR)), "Grid charge post cap")
+    afrr_charge = _validate_array_length(out.get("afrr_charge_qh_mwh", np.zeros(QH_PER_YEAR)), "aFRR charge post cap")
+
+    min_soc = float(inputs.batt_energy_mwh) * float(inputs.min_soc_pct) / 100.0
+    max_soc = float(inputs.batt_energy_mwh) * float(inputs.max_soc_pct) / 100.0
+    soc = np.zeros(QH_PER_YEAR + 1, dtype=float)
+    soc[0] = min(max(float(inputs.initial_soc_mwh), min_soc), max_soc)
+
+    for t in range(QH_PER_YEAR):
+        total_charge_input = pv_to_batt[t] + pv_curt_to_batt[t] + grid_charge[t] + afrr_charge[t]
+        max_charge_input = max(max_soc - soc[t], 0.0) / max(inputs.eta_charge, 1e-12)
+        if total_charge_input > max_charge_input + 1e-12:
+            scale = max_charge_input / max(total_charge_input, 1e-12)
+            pv_to_batt[t] *= scale
+            pv_curt_to_batt[t] *= scale
+            grid_charge[t] *= scale
+            afrr_charge[t] *= scale
+            total_charge_input = max_charge_input
+        total_discharge = keep_wh[t] + keep_afrr[t]
+        max_discharge = max(soc[t] - min_soc, 0.0) * max(inputs.eta_discharge, 1e-12)
+        if total_discharge > max_discharge + 1e-12:
+            scale = max_discharge / max(total_discharge, 1e-12)
+            keep_wh[t] *= scale
+            keep_afrr[t] *= scale
+            total_discharge = max_discharge
+        soc[t + 1] = min(max(soc[t] + total_charge_input * inputs.eta_charge - total_discharge / max(inputs.eta_discharge, 1e-12), min_soc), max_soc)
+
+    out["wholesale_pv_to_batt_qh_mwh"] = pv_to_batt
+    out["wholesale_pv_to_batt_hourly_mwh"] = pv_to_batt
+    out["wholesale_pv_curtailed_to_batt_qh_mwh"] = pv_curt_to_batt
+    out["wholesale_pv_curtailed_to_batt_hourly_mwh"] = pv_curt_to_batt
+    out["wholesale_grid_charge_qh_mwh"] = grid_charge
+    out["wholesale_grid_charge_hourly_mwh"] = grid_charge
+    out["afrr_charge_qh_mwh"] = afrr_charge
+    out["afrr_charge_hourly_mwh"] = afrr_charge
+    out["wholesale_discharge_qh_mwh"] = keep_wh
+    out["wholesale_discharge_hourly_mwh"] = keep_wh
+    out["afrr_discharge_qh_mwh"] = keep_afrr
+    out["afrr_discharge_hourly_mwh"] = keep_afrr
+
+    out["combined_soc_qh"] = soc
+    out["combined_soc_hourly_end_mwh"] = soc[1:]
+    out["combined_charge_to_soc_qh_mwh"] = (pv_to_batt + pv_curt_to_batt + grid_charge + afrr_charge) * inputs.eta_charge
+    out["combined_discharge_from_soc_qh_mwh"] = (keep_wh + keep_afrr) / max(inputs.eta_discharge, 1e-12)
+
+    out["wholesale_batt_sale_revenue_qh_eur"] = keep_wh * batt_sell
+    out["wholesale_batt_sale_revenue_hourly_eur"] = out["wholesale_batt_sale_revenue_qh_eur"]
+    out["wholesale_grid_charge_cost_qh_eur"] = grid_charge * grid_buy
+    out["wholesale_grid_charge_cost_hourly_eur"] = out["wholesale_grid_charge_cost_qh_eur"]
+    out["afrr_charge_cost_qh_eur"] = afrr_charge * afrr_charge_price
+    out["afrr_charge_cost_hourly_eur"] = out["afrr_charge_cost_qh_eur"]
+    out["afrr_sale_revenue_qh_eur"] = keep_afrr * afrr_discharge_price
+    out["afrr_sale_revenue_hourly_eur"] = out["afrr_sale_revenue_qh_eur"]
+    out["afrr_cycle_cost_qh_eur"] = keep_afrr / max(inputs.eta_discharge, 1e-12) * inputs.afrr_cycle_cost_eur_per_mwh
+    out["afrr_cycle_cost_hourly_eur"] = out["afrr_cycle_cost_qh_eur"]
+    out["afrr_net_revenue_qh_eur"] = out["afrr_sale_revenue_qh_eur"] - out["afrr_charge_cost_qh_eur"]
+    out["afrr_net_revenue_hourly_eur"] = out["afrr_net_revenue_qh_eur"]
+
+    combined_discharge = keep_wh + keep_afrr
+    cumulative = np.cumsum(combined_discharge)
+    remaining = np.maximum(annual_cap - cumulative, 0.0)
+    out["annual_discharge_cap_mwh"] = np.full(QH_PER_YEAR, annual_cap, dtype=float)
+    out["cumulative_battery_discharge_mwh"] = cumulative
+    out["remaining_discharge_budget_mwh"] = remaining
+    out["cycle_budget_used_pct"] = np.divide(cumulative, max(annual_cap, 1e-12), out=np.zeros(QH_PER_YEAR), where=annual_cap > 1e-12) * 100.0
+    out["cycle_budget_available_flag"] = (remaining > 1e-9).astype(int)
+    out["wholesale_discharge_rejected_due_to_cycle_budget"] = (wh_rejected > 1e-9).astype(int)
+    out["afrr_up_discharge_rejected_due_to_cycle_budget"] = (afrr_rejected > 1e-9).astype(int)
+    out["afrr_up_capacity_rejected_due_to_cycle_budget"] = (afrr_rejected > 1e-9).astype(int)
+    out["discharge_rejected_due_to_cycle_budget"] = ((wh_rejected + afrr_rejected) > 1e-9).astype(int)
+
+    # Ranking audit: 1 is highest net value among selected/rejected discharge candidates.
+    net_value = np.zeros(QH_PER_YEAR, dtype=float)
+    rank = np.zeros(QH_PER_YEAR, dtype=int)
+    try:
+        stored_cost = np.nan_to_num(np.asarray(out.get("stored_energy_cost_eur_per_mwh", np.zeros(QH_PER_YEAR)), dtype=float).reshape(-1)[:QH_PER_YEAR], nan=0.0)
+        cost_per_output = stored_cost / max(inputs.eta_discharge, 1e-12)
+        wh_value = batt_sell - cost_per_output - inputs.cycle_cost_eur_per_mwh / max(inputs.eta_discharge, 1e-12)
+        afrr_value = afrr_discharge_price - cost_per_output - inputs.afrr_cycle_cost_eur_per_mwh / max(inputs.eta_discharge, 1e-12)
+        net_value = np.maximum(np.where((keep_wh + wh_rejected) > 1e-12, wh_value, -1e30), np.where((keep_afrr + afrr_rejected) > 1e-12, afrr_value, -1e30))
+        candidate_idx = np.where(net_value > -1e20)[0]
+        order = candidate_idx[np.argsort(-net_value[candidate_idx])]
+        rank[order] = np.arange(1, len(order) + 1)
+        net_value[net_value <= -1e20] = 0.0
+    except Exception:
+        net_value = np.zeros(QH_PER_YEAR, dtype=float)
+        rank = np.zeros(QH_PER_YEAR, dtype=int)
+    out["net_dispatch_value_eur_per_mwh"] = net_value
+    out["cycle_budget_rank"] = rank
+
+    return out, {
+        "wholesale_rejected": int(np.sum(wh_rejected > 1e-9)),
+        "afrr_rejected": int(np.sum(afrr_rejected > 1e-9)),
+    }
+
 def build_final_result_after_market_arbitration(
     base_result: Dict[str, np.ndarray],
     reconciliation: Dict[str, np.ndarray],
@@ -2503,6 +2710,11 @@ def build_final_result_after_market_arbitration(
     final["max_cycles_per_year"] = np.array([float(inputs.max_cycles_per_year)])
     final["annual_discharge_cap_mwh"] = np.array([annual_discharge_cap_mwh])
     final["remaining_cycle_budget_mwh"] = np.array([max(annual_discharge_cap_mwh - total_discharged_mwh, 0.0)])
+    if float(final["equivalent_cycles"][0]) > float(inputs.max_cycles_per_year) + 1e-6:
+        raise RuntimeError(
+            "Annual cycle cap exceeded after final dispatch reconciliation: "
+            f"{float(final['equivalent_cycles'][0]):.6f} cycles > {float(inputs.max_cycles_per_year):.6f} cycles."
+        )
 
     final["total_revenue"] = np.array([
         total_direct_pv_revenue + total_batt_sale_revenue - total_grid_charge_cost + nightly_revenue_total
@@ -2520,6 +2732,17 @@ def build_final_result_after_market_arbitration(
         "spread_condition_respected",
         "wholesale_discharge_spread_ok",
         "afrr_up_discharge_spread_ok",
+        "annual_discharge_cap_mwh",
+        "cumulative_battery_discharge_mwh",
+        "remaining_discharge_budget_mwh",
+        "cycle_budget_used_pct",
+        "cycle_budget_available_flag",
+        "discharge_rejected_due_to_cycle_budget",
+        "wholesale_discharge_rejected_due_to_cycle_budget",
+        "afrr_up_discharge_rejected_due_to_cycle_budget",
+        "afrr_up_capacity_rejected_due_to_cycle_budget",
+        "net_dispatch_value_eur_per_mwh",
+        "cycle_budget_rank",
     ]:
         if _audit_key in reconciliation:
             final[_audit_key] = reconciliation[_audit_key]
@@ -3642,6 +3865,11 @@ def app():
             with st.spinner("Simulation aFRR quart-horaire et validation de livrabilité SOC finale en cours..."):
                 afrr_result = simulate_afrr_night_arbitrage(sim_inputs, result)
                 reconciliation = reconcile_wholesale_afrr_dispatch_qh(result_hourly=result, afrr_result=afrr_result, inputs=sim_inputs)
+                reconciliation, _cycle_budget_stats = enforce_hard_annual_cycle_cap_on_reconciliation(
+                    reconciliation,
+                    sim_inputs,
+                    afrr_capacity_result=afrr_capacity_result,
+                )
                 final_result = build_final_result_after_market_arbitration(base_result=result, reconciliation=reconciliation, inputs=sim_inputs)
 
                 # Final-combined-SOC deliverability enforcement.
@@ -3674,6 +3902,11 @@ def app():
                     result = optimize_dispatch_dp(sim_inputs)
                     afrr_result = simulate_afrr_night_arbitrage(sim_inputs, result)
                     reconciliation = reconcile_wholesale_afrr_dispatch_qh(result_hourly=result, afrr_result=afrr_result, inputs=sim_inputs)
+                    reconciliation, _cycle_budget_stats = enforce_hard_annual_cycle_cap_on_reconciliation(
+                        reconciliation,
+                        sim_inputs,
+                        afrr_capacity_result=afrr_capacity_result,
+                    )
                     final_result = build_final_result_after_market_arbitration(base_result=result, reconciliation=reconciliation, inputs=sim_inputs)
 
                 # Store final actual shortfalls in the capacity audit arrays.
@@ -4028,6 +4261,17 @@ def app():
             "afrr_down_rejected_due_to_final_combined_soc": final_result.get("afrr_down_rejected_due_to_final_combined_soc", np.zeros(QH_PER_YEAR)),
             "afrr_up_expected_vs_actual_shortfall_mwh": reconciliation.get("afrr_up_activation_shortfall_qh_mwh", np.zeros(QH_PER_YEAR)) if reconciliation is not None else np.zeros(QH_PER_YEAR),
             "afrr_down_expected_vs_actual_shortfall_mwh": reconciliation.get("afrr_down_activation_shortfall_qh_mwh", np.zeros(QH_PER_YEAR)) if reconciliation is not None else np.zeros(QH_PER_YEAR),
+            "annual_discharge_cap_mwh": final_result.get("annual_discharge_cap_mwh", np.full(QH_PER_YEAR, sim_inputs.max_cycles_per_year * sim_inputs.batt_energy_mwh)),
+            "cumulative_battery_discharge_mwh": final_result.get("cumulative_battery_discharge_mwh", np.zeros(QH_PER_YEAR)),
+            "remaining_discharge_budget_mwh": final_result.get("remaining_discharge_budget_mwh", np.zeros(QH_PER_YEAR)),
+            "cycle_budget_used_pct": final_result.get("cycle_budget_used_pct", np.zeros(QH_PER_YEAR)),
+            "cycle_budget_available_flag": final_result.get("cycle_budget_available_flag", np.zeros(QH_PER_YEAR)),
+            "discharge_rejected_due_to_cycle_budget": final_result.get("discharge_rejected_due_to_cycle_budget", np.zeros(QH_PER_YEAR)),
+            "wholesale_discharge_rejected_due_to_cycle_budget": final_result.get("wholesale_discharge_rejected_due_to_cycle_budget", np.zeros(QH_PER_YEAR)),
+            "afrr_up_discharge_rejected_due_to_cycle_budget": final_result.get("afrr_up_discharge_rejected_due_to_cycle_budget", np.zeros(QH_PER_YEAR)),
+            "afrr_up_capacity_rejected_due_to_cycle_budget": final_result.get("afrr_up_capacity_rejected_due_to_cycle_budget", np.zeros(QH_PER_YEAR)),
+            "net_dispatch_value_eur_per_mwh": final_result.get("net_dispatch_value_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+            "cycle_budget_rank": final_result.get("cycle_budget_rank", np.zeros(QH_PER_YEAR)),
             "pv_capture_rate_pct": np.full(QH_PER_YEAR, pv_capture_rate_pct),
             "bess_capture_rate_pct": np.full(QH_PER_YEAR, bess_capture_rate_pct),
         })
