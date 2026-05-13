@@ -103,6 +103,11 @@ class SimulationInputs:
     afrr_certified_capacity_down_mw: float = 0.0
     # Internal quarter-hour market selection used to block wholesale and gate aFRR energy.
     afrr_capacity_selected_market_h: np.ndarray | None = None
+    # Expected activated energy arrays from Phase-1 aFRR capacity selection.
+    # These are used to keep physical aFRR energy dispatch aligned with the
+    # expected MWh used in the capacity value comparison.
+    afrr_expected_up_activated_mwh_qh: np.ndarray | None = None
+    afrr_expected_down_activated_mwh_qh: np.ndarray | None = None
 
     # Curtailment
     enable_tso_dso_curtailment: bool = False
@@ -1588,6 +1593,8 @@ def simulate_afrr_night_arbitrage(inputs: SimulationInputs, result_hourly: Dict[
     up_activated_qh = np.zeros(QH_PER_YEAR, dtype=int)
     selected_charge_market_qh = np.full(QH_PER_YEAR, "none", dtype=object)
     selected_discharge_market_qh = np.full(QH_PER_YEAR, "none", dtype=object)
+    up_activation_shortfall_qh = np.zeros(QH_PER_YEAR, dtype=float)
+    down_activation_shortfall_qh = np.zeros(QH_PER_YEAR, dtype=float)
 
     min_soc_mwh = inputs.batt_energy_mwh * inputs.min_soc_pct / 100.0
     max_soc_mwh = inputs.batt_energy_mwh * inputs.max_soc_pct / 100.0
@@ -1608,47 +1615,80 @@ def simulate_afrr_night_arbitrage(inputs: SimulationInputs, result_hourly: Dict[
 
         # Capacity-linked aFRR energy is represented as expected activated MWh on every awarded interval.
         # Activation percentages scale MWh, not the number of selected intervals.
+        # IMPORTANT FIX: the physical aFRR energy dispatch now follows the same
+        # expected activated MWh arrays used in simulate_afrr_capacity() for the
+        # market-value comparison. This keeps the selected aFRR capacity value and
+        # the actual aFRR energy dispatch consistent, subject only to hard physical
+        # SOC, power and export constraints.
         down_selected_qh = (capacity_selected_h == "down")
         up_selected_qh = (capacity_selected_h == "up")
         down_selected_h = down_selected_qh.astype(int)
         up_selected_h = up_selected_qh.astype(int)
-        activation_down_factor = min(max(float(inputs.afrr_energy_down_activation_pct) / 100.0, 0.0), 1.0)
-        activation_up_factor = min(max(float(inputs.afrr_energy_up_activation_pct) / 100.0, 0.0), 1.0)
+
+        if inputs.afrr_expected_down_activated_mwh_qh is not None:
+            expected_down_dispatch_qh = _validate_array_length(
+                inputs.afrr_expected_down_activated_mwh_qh,
+                "Expected aFRR Down activated MWh",
+                QH_PER_YEAR,
+            )
+        else:
+            activation_down_factor = min(max(float(inputs.afrr_energy_down_activation_pct) / 100.0, 0.0), 1.0)
+            expected_down_dispatch_qh = down_selected_qh.astype(float) * max_charge_input_qh * activation_down_factor
+
+        if inputs.afrr_expected_up_activated_mwh_qh is not None:
+            expected_up_dispatch_qh = _validate_array_length(
+                inputs.afrr_expected_up_activated_mwh_qh,
+                "Expected aFRR Up activated MWh",
+                QH_PER_YEAR,
+            )
+        else:
+            activation_up_factor = min(max(float(inputs.afrr_energy_up_activation_pct) / 100.0, 0.0), 1.0)
+            expected_up_dispatch_qh = up_selected_qh.astype(float) * max_discharge_output_qh * activation_up_factor
+
+        # Ensure non-awarded directions cannot create activation.
+        expected_down_dispatch_qh = np.where(down_selected_qh, np.maximum(expected_down_dispatch_qh, 0.0), 0.0)
+        expected_up_dispatch_qh = np.where(up_selected_qh, np.maximum(expected_up_dispatch_qh, 0.0), 0.0)
+
+        up_activation_shortfall_qh = np.zeros(QH_PER_YEAR, dtype=float)
+        down_activation_shortfall_qh = np.zeros(QH_PER_YEAR, dtype=float)
 
         for t in range(QH_PER_YEAR):
             if down_selected_qh[t]:
-                input_this_qh = min(
-                    max_charge_input_qh * activation_down_factor,
+                target_input_qh = min(float(expected_down_dispatch_qh[t]), max_charge_input_qh)
+                feasible_input_qh = min(
+                    target_input_qh,
                     max(max_soc_mwh - soc_current, 0.0) / max(inputs.eta_charge, 1e-12),
                 )
-                if input_this_qh > 1e-12:
-                    afrr_charge_qh_mwh[t] = input_this_qh
-                    afrr_charge_cost_qh_eur[t] = input_this_qh * charge_prices_qh[t]
+                down_activation_shortfall_qh[t] = max(target_input_qh - feasible_input_qh, 0.0)
+                if feasible_input_qh > 1e-12:
+                    afrr_charge_qh_mwh[t] = feasible_input_qh
+                    afrr_charge_cost_qh_eur[t] = feasible_input_qh * charge_prices_qh[t]
                     afrr_net_revenue_qh_eur[t] -= afrr_charge_cost_qh_eur[t]
-                    soc_current += input_this_qh * inputs.eta_charge
+                    soc_current += feasible_input_qh * inputs.eta_charge
                     down_activated_qh[t] = 1
                     selected_charge_market_qh[t] = "afrr"
             elif up_selected_qh[t]:
                 pv_direct_t = float(np.asarray(result_hourly.get("pv_direct", np.zeros(QH_PER_YEAR)), dtype=float)[t])
                 export_room_t = max(max_export_qh - pv_direct_t, 0.0)
-                discharge_this_qh = min(
-                    max_discharge_output_qh * activation_up_factor,
+                target_discharge_qh = min(float(expected_up_dispatch_qh[t]), max_discharge_output_qh)
+                feasible_discharge_qh = min(
+                    target_discharge_qh,
                     export_room_t,
                     max(soc_current - min_soc_mwh, 0.0) * inputs.eta_discharge,
                 )
-                if discharge_this_qh > 1e-12:
-                    soc_removed = discharge_this_qh / max(inputs.eta_discharge, 1e-12)
+                up_activation_shortfall_qh[t] = max(target_discharge_qh - feasible_discharge_qh, 0.0)
+                if feasible_discharge_qh > 1e-12:
+                    soc_removed = feasible_discharge_qh / max(inputs.eta_discharge, 1e-12)
                     theoretical_cycle_cost = soc_removed * inputs.afrr_cycle_cost_eur_per_mwh
-                    expected_sale_revenue = discharge_this_qh * discharge_prices_qh[t]
-                    # Reference-only aFRR cycle-cost hurdle: skip activation if the
-                    # activation value does not cover the theoretical degradation cost.
-                    # The cost is NOT deducted from reported cash revenue when accepted.
-                    if expected_sale_revenue <= theoretical_cycle_cost + 1e-12:
-                        continue
-                    afrr_discharge_qh_mwh[t] = discharge_this_qh
+                    expected_sale_revenue = feasible_discharge_qh * discharge_prices_qh[t]
+                    # Do not re-apply the cycle-cost hurdle here: the expected aFRR
+                    # capacity selection already included degradation/cycle cost in
+                    # the value comparison. Re-applying it would make actual dispatch
+                    # diverge from the expected MWh used for market selection.
+                    afrr_discharge_qh_mwh[t] = feasible_discharge_qh
                     afrr_sale_revenue_qh_eur[t] = expected_sale_revenue
                     afrr_cycle_cost_qh_eur[t] = theoretical_cycle_cost
-                    afrr_net_revenue_qh_eur[t] += afrr_sale_revenue_qh_eur[t]  # aFRR cycle cost is a decision/reference metric only, not deducted from cash revenue
+                    afrr_net_revenue_qh_eur[t] += afrr_sale_revenue_qh_eur[t]
                     soc_current -= soc_removed
                     up_activated_qh[t] = 1
                     selected_discharge_market_qh[t] = "afrr"
@@ -1788,6 +1828,8 @@ def simulate_afrr_night_arbitrage(inputs: SimulationInputs, result_hourly: Dict[
         "afrr_net_revenue_qh_eur": afrr_net_revenue_qh_eur,
         "afrr_energy_down_activated_qh": down_activated_qh,
         "afrr_energy_up_activated_qh": up_activated_qh,
+        "afrr_up_activation_shortfall_qh_mwh": up_activation_shortfall_qh,
+        "afrr_down_activation_shortfall_qh_mwh": down_activation_shortfall_qh,
         "selected_charge_market_qh": selected_charge_market_qh,
         "selected_discharge_market_qh": selected_discharge_market_qh,
         "afrr_daily_log": pd.DataFrame(daily_logs),
@@ -1816,6 +1858,8 @@ def reconcile_wholesale_afrr_dispatch_qh(
     afrr_discharge_qh = np.asarray(afrr_result["afrr_discharge_qh_mwh"], dtype=float).copy()
     down_activated_qh = np.asarray(afrr_result.get("afrr_energy_down_activated_qh", np.zeros(QH_PER_YEAR)), dtype=int)
     up_activated_qh = np.asarray(afrr_result.get("afrr_energy_up_activated_qh", np.zeros(QH_PER_YEAR)), dtype=int)
+    up_activation_shortfall_qh = np.asarray(afrr_result.get("afrr_up_activation_shortfall_qh_mwh", np.zeros(QH_PER_YEAR)), dtype=float)
+    down_activation_shortfall_qh = np.asarray(afrr_result.get("afrr_down_activation_shortfall_qh_mwh", np.zeros(QH_PER_YEAR)), dtype=float)
 
     if inputs.afrr_capacity_selected_market_h is None:
         afrr_capacity_selected_market_h = np.full(QH_PER_YEAR, "none", dtype=object)
@@ -1992,6 +2036,8 @@ def reconcile_wholesale_afrr_dispatch_qh(
         "afrr_net_revenue_qh_eur": corrected_afrr_net_revenue_qh,
         "afrr_energy_down_activated_qh": down_activated_qh,
         "afrr_energy_up_activated_qh": up_activated_qh,
+        "afrr_up_activation_shortfall_qh_mwh": up_activation_shortfall_qh,
+        "afrr_down_activation_shortfall_qh_mwh": down_activation_shortfall_qh,
         "selected_charge_market_qh": selected_charge_market_qh,
         "selected_charge_price_qh": selected_charge_price_qh,
         "selected_discharge_market_qh": selected_discharge_market_qh,
@@ -3136,6 +3182,8 @@ def app():
 
         afrr_capacity_result = simulate_afrr_capacity(sim_inputs, wholesale_reference_result=wholesale_reference_result)
         sim_inputs.afrr_capacity_selected_market_h = afrr_capacity_result["afrr_capacity_selected_market_h"]
+        sim_inputs.afrr_expected_up_activated_mwh_qh = afrr_capacity_result.get("expected_up_activated_mwh", np.zeros(QH_PER_YEAR, dtype=float))
+        sim_inputs.afrr_expected_down_activated_mwh_qh = afrr_capacity_result.get("expected_down_activated_mwh", np.zeros(QH_PER_YEAR, dtype=float))
 
         with st.spinner("Optimisation économique annuelle finale en cours..."):
             result = optimize_dispatch_dp(sim_inputs)
@@ -3489,6 +3537,10 @@ def app():
                 "afrr_discharge_price_effective_eur_per_mwh": sim_inputs.afrr_discharge_price_qh,
                 "afrr_charge_mwh": reconciliation["afrr_charge_qh_mwh"],
                 "afrr_discharge_mwh": reconciliation["afrr_discharge_qh_mwh"],
+                "expected_down_activated_mwh_from_capacity_selection": sim_inputs.afrr_expected_down_activated_mwh_qh if sim_inputs.afrr_expected_down_activated_mwh_qh is not None else np.zeros(QH_PER_YEAR),
+                "expected_up_activated_mwh_from_capacity_selection": sim_inputs.afrr_expected_up_activated_mwh_qh if sim_inputs.afrr_expected_up_activated_mwh_qh is not None else np.zeros(QH_PER_YEAR),
+                "afrr_down_activation_shortfall_mwh": reconciliation.get("afrr_down_activation_shortfall_qh_mwh", np.zeros(QH_PER_YEAR)),
+                "afrr_up_activation_shortfall_mwh": reconciliation.get("afrr_up_activation_shortfall_qh_mwh", np.zeros(QH_PER_YEAR)),
                 "afrr_energy_down_activated": reconciliation["afrr_energy_down_activated_qh"],
                 "afrr_energy_up_activated": reconciliation["afrr_energy_up_activated_qh"],
                 "selected_charge_market": reconciliation["selected_charge_market_qh"],
