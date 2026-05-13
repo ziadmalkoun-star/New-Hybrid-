@@ -4467,12 +4467,14 @@ def app():
             data=excel_bytes,
             file_name="simulation_complete_hybride_pv_bess.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            on_click="ignore",
         )
         st.download_button(
             "Télécharger l'horaire en CSV",
             data=hourly_df.to_csv(index=False).encode("utf-8"),
             file_name="dispatch_horaire_hybride.csv",
             mime="text/csv",
+            on_click="ignore",
         )
 
         if afrr_qh_df is not None:
@@ -4481,6 +4483,7 @@ def app():
                 data=afrr_qh_df.to_csv(index=False).encode("utf-8"),
                 file_name="dispatch_afrr_quart_horaire.csv",
                 mime="text/csv",
+                on_click="ignore",
             )
 
     except Exception as e:
