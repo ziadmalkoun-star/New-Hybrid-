@@ -197,6 +197,48 @@ def compute_forward_cross_market_value_curves(inputs: SimulationInputs) -> Dict[
         "forward_horizon_hours": np.full(QH_PER_YEAR, float(inputs.forward_optimization_horizon_hours), dtype=float),
     }
 
+
+
+def _make_qh_dataframe(data: dict, expected_len: int = QH_PER_YEAR) -> pd.DataFrame:
+    """Build a DataFrame from quarter-hour arrays, expanding scalar/1-row values.
+
+    Streamlit output exports mix true 35,040-step arrays with scalar summary
+    arrays such as np.array([annual_cap]). Pandas requires equal lengths; this
+    helper expands scalars and 1-element arrays to expected_len and pads/truncates
+    other mismatched arrays defensively so exports do not fail.
+    """
+    normalized = {}
+    for key, value in data.items():
+        if isinstance(value, pd.Series):
+            arr = value.to_numpy()
+        elif isinstance(value, pd.Index):
+            arr = value.to_numpy()
+        else:
+            try:
+                arr = np.asarray(value)
+            except Exception:
+                normalized[key] = np.full(expected_len, value, dtype=object)
+                continue
+
+        if arr.ndim == 0:
+            normalized[key] = np.full(expected_len, arr.item())
+            continue
+
+        arr = arr.reshape(-1)
+        if len(arr) == expected_len:
+            normalized[key] = arr
+        elif len(arr) == 1:
+            normalized[key] = np.full(expected_len, arr[0])
+        elif len(arr) > expected_len:
+            normalized[key] = arr[:expected_len]
+        else:
+            pad_value = np.nan if arr.dtype.kind in "fiu" else None
+            padded = np.empty(expected_len, dtype=arr.dtype if arr.dtype.kind not in "OUS" else object)
+            padded[:len(arr)] = arr
+            padded[len(arr):] = pad_value
+            normalized[key] = padded
+    return pd.DataFrame(normalized)
+
 def build_combined_soc_with_afrr(
     result_hourly: Dict[str, np.ndarray],
     afrr_result: Dict[str, np.ndarray] | None,
@@ -4038,7 +4080,7 @@ def app():
             st.warning(f"Impossible de calculer le scénario sans coût de cycle: {e}")
 
         if reconciliation is not None:
-            combined_qh_df = pd.DataFrame({
+            combined_qh_df = _make_qh_dataframe({
                 "datetime": reconciliation["datetime_qh"],
                 "combined_charge_to_soc_qh_mwh": reconciliation["combined_charge_to_soc_qh_mwh"],
                 "combined_discharge_from_soc_qh_mwh": reconciliation["combined_discharge_from_soc_qh_mwh"],
@@ -4075,7 +4117,7 @@ def app():
                 max_soc_pct=sim_inputs.max_soc_pct,
             )
 
-            combined_qh_df = pd.DataFrame({
+            combined_qh_df = _make_qh_dataframe({
                 "datetime": build_quarter_hour_index(DEFAULT_YEAR),
                 "combined_charge_to_soc_qh_mwh": combined_soc_result["combined_charge_to_soc_qh"],
                 "combined_discharge_from_soc_qh_mwh": combined_soc_result["combined_discharge_from_soc_qh"],
@@ -4152,7 +4194,7 @@ def app():
         
             combined_soc_hourly_end = soc_hourly[1:]
             
-        hourly_df = pd.DataFrame({
+        hourly_df = _make_qh_dataframe({
             "datetime": idx,
             "base_pv_generation_mwh": base_pv_hourly_mwh,
             "pv_after_tso_dso_curtailment_mwh": pv_after_tso_dso,
@@ -4291,7 +4333,7 @@ def app():
 
         afrr_qh_df = None
         if reconciliation is not None:
-            afrr_qh_df = pd.DataFrame({
+            afrr_qh_df = _make_qh_dataframe({
                 "datetime": reconciliation["datetime_qh"],
                 "afrr_charge_price_raw_eur_per_mwh": afrr_charge_curve_qh_raw if afrr_charge_curve_qh_raw is not None else np.zeros(QH_PER_YEAR),
                 "afrr_charge_price_effective_eur_per_mwh": sim_inputs.afrr_charge_price_qh,
@@ -4326,7 +4368,7 @@ def app():
                 "bess_capture_rate_pct": np.full(QH_PER_YEAR, bess_capture_rate_pct),
             })
 
-        afrr_capacity_df = pd.DataFrame({
+        afrr_capacity_df = _make_qh_dataframe({
             "datetime": idx,
             "afrr_capacity_up_price_eur_per_mw_h": afrr_capacity_up_price_h_raw if afrr_capacity_up_price_h_raw is not None else np.zeros(QH_PER_YEAR),
             "afrr_capacity_down_price_eur_per_mw_h": afrr_capacity_down_price_h_raw if afrr_capacity_down_price_h_raw is not None else np.zeros(QH_PER_YEAR),
