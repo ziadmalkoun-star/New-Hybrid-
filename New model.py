@@ -539,6 +539,8 @@ def simulate_afrr_capacity(
         "afrr_down_rejected_due_to_soc": audit_zero_bool.copy(),
         "afrr_up_expected_vs_actual_shortfall_mwh": zero_f.copy(),
         "afrr_down_expected_vs_actual_shortfall_mwh": zero_f.copy(),
+        "afrr_up_rejected_due_to_final_combined_soc": audit_zero_bool.copy(),
+        "afrr_down_rejected_due_to_final_combined_soc": audit_zero_bool.copy(),
     }
 
     if not inputs.enable_afrr_capacity:
@@ -750,6 +752,8 @@ def simulate_afrr_capacity(
         "afrr_down_rejected_due_to_soc": down_rejected_due_to_soc,
         "afrr_up_expected_vs_actual_shortfall_mwh": np.zeros(QH_PER_YEAR, dtype=float),
         "afrr_down_expected_vs_actual_shortfall_mwh": np.zeros(QH_PER_YEAR, dtype=float),
+        "afrr_up_rejected_due_to_final_combined_soc": np.zeros(QH_PER_YEAR, dtype=int),
+        "afrr_down_rejected_due_to_final_combined_soc": np.zeros(QH_PER_YEAR, dtype=int),
     }
 
 def build_standard_france_solar_profile() -> np.ndarray:
@@ -1618,6 +1622,129 @@ def _select_best_daily_afrr_competing_blocks(
     return best
 
 
+
+def enforce_afrr_capacity_deliverability_from_final_dispatch(
+    afrr_capacity_result: Dict[str, np.ndarray],
+    reconciliation: Dict[str, np.ndarray] | None,
+    tolerance_mwh: float = 1e-6,
+) -> tuple[Dict[str, np.ndarray], Dict[str, int]]:
+    """Remove aFRR capacity awards that cannot be delivered in final dispatch.
+
+    simulate_afrr_capacity() uses a forward-SOC approximation before the final
+    wholesale/aFRR reconciliation is known. This post-pass validates awarded
+    capacity against the actual final combined dispatch. Any UP award whose
+    expected activation is not physically delivered in the final reconciliation
+    is removed, then the caller should rerun final DP/aFRR dispatch using the
+    filtered awards. This makes UP capacity awards require deliverability under
+    the final combined SOC trajectory, not only the preliminary forward tracker.
+    """
+    if afrr_capacity_result is None or reconciliation is None:
+        return afrr_capacity_result, {"removed_up": 0, "removed_down": 0}
+
+    filtered: Dict[str, np.ndarray] = {}
+    for key, value in afrr_capacity_result.items():
+        if isinstance(value, np.ndarray):
+            filtered[key] = value.copy()
+        else:
+            filtered[key] = value
+
+    selected = np.asarray(filtered.get("afrr_capacity_selected_market_h", np.full(QH_PER_YEAR, "none", dtype=object)), dtype=object).copy()
+    selected_market = np.asarray(filtered.get("selected_market", np.full(QH_PER_YEAR, "none", dtype=object)), dtype=object).copy()
+    selected_direction = np.asarray(filtered.get("selected_capacity_direction", selected), dtype=object).copy()
+
+    expected_up = _validate_array_length(filtered.get("expected_up_activated_mwh", np.zeros(QH_PER_YEAR)), "Expected aFRR UP activated MWh")
+    expected_down = _validate_array_length(filtered.get("expected_down_activated_mwh", np.zeros(QH_PER_YEAR)), "Expected aFRR DOWN activated MWh")
+    actual_up = _validate_array_length(reconciliation.get("afrr_discharge_qh_mwh", np.zeros(QH_PER_YEAR)), "Actual aFRR UP discharge MWh")
+    actual_down = _validate_array_length(reconciliation.get("afrr_charge_qh_mwh", np.zeros(QH_PER_YEAR)), "Actual aFRR DOWN charge MWh")
+
+    up_shortfall = np.maximum(expected_up - actual_up, 0.0)
+    down_shortfall = np.maximum(expected_down - actual_down, 0.0)
+
+    # UP deliverability is the critical issue observed in the simulations:
+    # reject any UP award that final combined SOC/export constraints cannot activate.
+    remove_up = (selected == "up") & (up_shortfall > tolerance_mwh)
+    # Apply the same consistency rule to DOWN as a safety check; it usually removes few/no intervals.
+    remove_down = (selected == "down") & (down_shortfall > tolerance_mwh)
+
+    removed_up_count = int(np.sum(remove_up))
+    removed_down_count = int(np.sum(remove_down))
+
+    if removed_up_count == 0 and removed_down_count == 0:
+        filtered["afrr_up_expected_vs_actual_shortfall_mwh"] = up_shortfall
+        filtered["afrr_down_expected_vs_actual_shortfall_mwh"] = down_shortfall
+        filtered["afrr_up_rejected_due_to_final_combined_soc"] = np.zeros(QH_PER_YEAR, dtype=int)
+        filtered["afrr_down_rejected_due_to_final_combined_soc"] = np.zeros(QH_PER_YEAR, dtype=int)
+        return filtered, {"removed_up": 0, "removed_down": 0}
+
+    rejected_up_final = np.asarray(filtered.get("afrr_up_rejected_due_to_final_combined_soc", np.zeros(QH_PER_YEAR)), dtype=int).copy()
+    rejected_down_final = np.asarray(filtered.get("afrr_down_rejected_due_to_final_combined_soc", np.zeros(QH_PER_YEAR)), dtype=int).copy()
+    rejected_up_final[remove_up] = 1
+    rejected_down_final[remove_down] = 1
+
+    remove_any = remove_up | remove_down
+    selected[remove_any] = "none"
+    selected_market[remove_any] = "none"
+    selected_direction[remove_any] = "none"
+
+    filtered["afrr_capacity_selected_market_h"] = selected
+    filtered["selected_market"] = selected_market
+    filtered["selected_capacity_direction"] = selected_direction
+
+    if "afrr_capacity_up_awarded_h" in filtered:
+        arr = np.asarray(filtered["afrr_capacity_up_awarded_h"], dtype=int).copy()
+        arr[remove_up] = 0
+        filtered["afrr_capacity_up_awarded_h"] = arr
+    if "afrr_capacity_down_awarded_h" in filtered:
+        arr = np.asarray(filtered["afrr_capacity_down_awarded_h"], dtype=int).copy()
+        arr[remove_down] = 0
+        filtered["afrr_capacity_down_awarded_h"] = arr
+
+    zero_when_removed_keys = [
+        "afrr_capacity_up_revenue_h_eur",
+        "expected_up_activated_mwh",
+        "afrr_up_energy_expected_value_eur",
+        "expected_degradation_cost_eur",
+    ]
+    for key in zero_when_removed_keys:
+        if key in filtered:
+            arr = np.asarray(filtered[key], dtype=float).copy()
+            arr[remove_up] = 0.0
+            filtered[key] = arr
+
+    zero_down_keys = [
+        "afrr_capacity_down_revenue_h_eur",
+        "expected_down_activated_mwh",
+        "afrr_down_energy_expected_value_eur",
+    ]
+    for key in zero_down_keys:
+        if key in filtered:
+            arr = np.asarray(filtered[key], dtype=float).copy()
+            arr[remove_down] = 0.0
+            filtered[key] = arr
+
+    for key, mask in [
+        ("afrr_up_total_expected_value_eur", remove_up),
+        ("afrr_down_total_expected_value_eur", remove_down),
+        ("expected_up_capacity_revenue_eur", remove_up),
+        ("expected_down_capacity_revenue_eur", remove_down),
+    ]:
+        # Keep raw price/value columns for audit, but zero selected expected value columns on rejected awards.
+        if key in filtered and key not in ("expected_up_capacity_revenue_eur", "expected_down_capacity_revenue_eur"):
+            arr = np.asarray(filtered[key], dtype=float).copy()
+            arr[mask] = 0.0
+            filtered[key] = arr
+
+    up_rev = np.asarray(filtered.get("afrr_capacity_up_revenue_h_eur", np.zeros(QH_PER_YEAR)), dtype=float)
+    down_rev = np.asarray(filtered.get("afrr_capacity_down_revenue_h_eur", np.zeros(QH_PER_YEAR)), dtype=float)
+    filtered["afrr_capacity_total_revenue_h_eur"] = up_rev + down_rev
+
+    filtered["afrr_up_expected_vs_actual_shortfall_mwh"] = up_shortfall
+    filtered["afrr_down_expected_vs_actual_shortfall_mwh"] = down_shortfall
+    filtered["afrr_up_rejected_due_to_final_combined_soc"] = rejected_up_final
+    filtered["afrr_down_rejected_due_to_final_combined_soc"] = rejected_down_final
+
+    return filtered, {"removed_up": removed_up_count, "removed_down": removed_down_count}
+
 def simulate_afrr_night_arbitrage(inputs: SimulationInputs, result_hourly: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     if not inputs.enable_afrr:
         return {
@@ -2287,6 +2414,8 @@ def add_afrr_capacity_to_final_result(
             "afrr_down_rejected_due_to_soc",
             "afrr_up_expected_vs_actual_shortfall_mwh",
             "afrr_down_expected_vs_actual_shortfall_mwh",
+            "afrr_up_rejected_due_to_final_combined_soc",
+            "afrr_down_rejected_due_to_final_combined_soc",
         ]:
             final[_k] = np.asarray(afrr_capacity_result.get(_k, np.zeros(QH_PER_YEAR)), dtype=object if _k in ("selected_market", "selected_capacity_direction") else float)
 
@@ -3269,10 +3398,53 @@ def app():
         final_result = result
 
         if sim_inputs.enable_afrr:
-            with st.spinner("Simulation aFRR quart-horaire de nuit en cours..."):
+            with st.spinner("Simulation aFRR quart-horaire et validation de livrabilité SOC finale en cours..."):
                 afrr_result = simulate_afrr_night_arbitrage(sim_inputs, result)
                 reconciliation = reconcile_wholesale_afrr_dispatch_qh(result_hourly=result, afrr_result=afrr_result, inputs=sim_inputs)
                 final_result = build_final_result_after_market_arbitration(base_result=result, reconciliation=reconciliation, inputs=sim_inputs)
+
+                # Final-combined-SOC deliverability enforcement.
+                # The first aFRR capacity pass uses a forward approximation; this loop
+                # removes UP/DOWN awards that the final physical combined SOC trajectory
+                # could not deliver, then reruns the final DP/aFRR dispatch.
+                for _deliverability_pass in range(3):
+                    afrr_capacity_result, _deliverability_stats = enforce_afrr_capacity_deliverability_from_final_dispatch(
+                        afrr_capacity_result,
+                        reconciliation,
+                        tolerance_mwh=1e-6,
+                    )
+
+                    if (
+                        _deliverability_stats.get("removed_up", 0) == 0
+                        and _deliverability_stats.get("removed_down", 0) == 0
+                    ):
+                        break
+
+                    sim_inputs.afrr_capacity_selected_market_h = afrr_capacity_result["afrr_capacity_selected_market_h"]
+                    sim_inputs.afrr_expected_up_activated_mwh_qh = afrr_capacity_result.get(
+                        "expected_up_activated_mwh",
+                        np.zeros(QH_PER_YEAR, dtype=float),
+                    )
+                    sim_inputs.afrr_expected_down_activated_mwh_qh = afrr_capacity_result.get(
+                        "expected_down_activated_mwh",
+                        np.zeros(QH_PER_YEAR, dtype=float),
+                    )
+
+                    result = optimize_dispatch_dp(sim_inputs)
+                    afrr_result = simulate_afrr_night_arbitrage(sim_inputs, result)
+                    reconciliation = reconcile_wholesale_afrr_dispatch_qh(result_hourly=result, afrr_result=afrr_result, inputs=sim_inputs)
+                    final_result = build_final_result_after_market_arbitration(base_result=result, reconciliation=reconciliation, inputs=sim_inputs)
+
+                # Store final actual shortfalls in the capacity audit arrays.
+                if reconciliation is not None:
+                    afrr_capacity_result["afrr_up_expected_vs_actual_shortfall_mwh"] = reconciliation.get(
+                        "afrr_up_activation_shortfall_qh_mwh",
+                        np.zeros(QH_PER_YEAR, dtype=float),
+                    )
+                    afrr_capacity_result["afrr_down_expected_vs_actual_shortfall_mwh"] = reconciliation.get(
+                        "afrr_down_activation_shortfall_qh_mwh",
+                        np.zeros(QH_PER_YEAR, dtype=float),
+                    )
 
         final_result = add_afrr_capacity_to_final_result(final_result, afrr_capacity_result)
 
@@ -3592,6 +3764,8 @@ def app():
             "afrr_down_soc_feasible": final_result.get("afrr_down_soc_feasible", np.zeros(QH_PER_YEAR)),
             "afrr_up_rejected_due_to_soc": final_result.get("afrr_up_rejected_due_to_soc", np.zeros(QH_PER_YEAR)),
             "afrr_down_rejected_due_to_soc": final_result.get("afrr_down_rejected_due_to_soc", np.zeros(QH_PER_YEAR)),
+            "afrr_up_rejected_due_to_final_combined_soc": final_result.get("afrr_up_rejected_due_to_final_combined_soc", np.zeros(QH_PER_YEAR)),
+            "afrr_down_rejected_due_to_final_combined_soc": final_result.get("afrr_down_rejected_due_to_final_combined_soc", np.zeros(QH_PER_YEAR)),
             "afrr_up_expected_vs_actual_shortfall_mwh": reconciliation.get("afrr_up_activation_shortfall_qh_mwh", np.zeros(QH_PER_YEAR)) if reconciliation is not None else np.zeros(QH_PER_YEAR),
             "afrr_down_expected_vs_actual_shortfall_mwh": reconciliation.get("afrr_down_activation_shortfall_qh_mwh", np.zeros(QH_PER_YEAR)) if reconciliation is not None else np.zeros(QH_PER_YEAR),
             "pv_capture_rate_pct": np.full(QH_PER_YEAR, pv_capture_rate_pct),
@@ -3687,6 +3861,8 @@ def app():
             "afrr_down_soc_feasible": final_result.get("afrr_down_soc_feasible", np.zeros(QH_PER_YEAR)),
             "afrr_up_rejected_due_to_soc": final_result.get("afrr_up_rejected_due_to_soc", np.zeros(QH_PER_YEAR)),
             "afrr_down_rejected_due_to_soc": final_result.get("afrr_down_rejected_due_to_soc", np.zeros(QH_PER_YEAR)),
+            "afrr_up_rejected_due_to_final_combined_soc": final_result.get("afrr_up_rejected_due_to_final_combined_soc", np.zeros(QH_PER_YEAR)),
+            "afrr_down_rejected_due_to_final_combined_soc": final_result.get("afrr_down_rejected_due_to_final_combined_soc", np.zeros(QH_PER_YEAR)),
             "afrr_up_expected_vs_actual_shortfall_mwh": reconciliation.get("afrr_up_activation_shortfall_qh_mwh", np.zeros(QH_PER_YEAR)) if reconciliation is not None else np.zeros(QH_PER_YEAR),
             "afrr_down_expected_vs_actual_shortfall_mwh": reconciliation.get("afrr_down_activation_shortfall_qh_mwh", np.zeros(QH_PER_YEAR)) if reconciliation is not None else np.zeros(QH_PER_YEAR),
         })
