@@ -71,6 +71,10 @@ class SimulationInputs:
     discharge_quantile: float = 0.0
     max_cycles_per_year: float = 1.0
     min_spread_arbitrage_eur_per_mwh: float = 0.0
+    # Forward-looking cross-market optimization controls
+    forward_optimization_horizon_hours: float = 24.0
+    afrr_up_cross_market_min_spread_eur_per_mwh: float = 20.0
+    afrr_down_to_wholesale_min_spread_eur_per_mwh: float = 20.0
 
     # Capture rates
     pv_capture_rate_pct: float = 100.0
@@ -135,6 +139,63 @@ def _validate_array_length(arr: np.ndarray, name: str, expected_len: int = QH_PE
     if np.any(~np.isfinite(arr)):
         raise ValueError(f"{name} contient des valeurs non numériques ou infinies.")
     return arr
+
+
+def rolling_forward_max(values: np.ndarray, horizon_steps: int) -> np.ndarray:
+    """Maximum future value within (t, t + horizon_steps]."""
+    values = np.asarray(values, dtype=float).reshape(-1)
+    out = np.full(len(values), -1e30, dtype=float)
+    h = int(max(1, horizon_steps))
+    for t in range(len(values)):
+        end = min(len(values), t + h + 1)
+        if t + 1 < end:
+            out[t] = float(np.nanmax(values[t + 1:end]))
+    return out
+
+
+def compute_forward_cross_market_value_curves(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
+    """Build practical forward-looking value curves for cross-market charging.
+
+    This is intentionally lightweight and compatible with the existing DP.
+    It does not replace the full dispatch optimizer with LP/MILP; it provides
+    forward opportunity signals used as charging gates and audit columns.
+    """
+    horizon_steps = int(max(1, round(float(inputs.forward_optimization_horizon_hours) * QH_PER_HOUR)))
+
+    wholesale_value = _validate_array_length(inputs.batt_sell_price, "BESS sell price", QH_PER_YEAR) * (float(inputs.bess_capture_rate_pct) / 100.0)
+
+    if inputs.enable_afrr and inputs.afrr_discharge_price_qh is not None:
+        afrr_up_energy = _validate_array_length(inputs.afrr_discharge_price_qh, "aFRR UP energy price", QH_PER_YEAR)
+    else:
+        afrr_up_energy = np.full(QH_PER_YEAR, -1e30, dtype=float)
+
+    if inputs.enable_afrr_capacity and inputs.afrr_capacity_up_price_h is not None:
+        cap_up = _validate_array_length(inputs.afrr_capacity_up_price_h, "aFRR UP capacity price", QH_PER_YEAR)
+        success = min(max(float(inputs.afrr_capacity_success_rate_pct) / 100.0, 0.0), 1.0)
+        activation_up = min(max(float(inputs.afrr_energy_up_activation_pct) / 100.0, 0.0), 1.0)
+        if activation_up > 1e-9:
+            # Convert capacity availability value into an expected EUR/MWh uplift
+            # on activated UP energy. This is an expected-value signal only.
+            cap_uplift_per_mwh = cap_up * success / activation_up
+        else:
+            cap_uplift_per_mwh = np.zeros(QH_PER_YEAR, dtype=float)
+        afrr_up_value = afrr_up_energy + cap_uplift_per_mwh
+    else:
+        afrr_up_value = afrr_up_energy.copy()
+
+    future_wholesale = rolling_forward_max(wholesale_value, horizon_steps)
+    future_afrr_up = rolling_forward_max(afrr_up_value, horizon_steps)
+    future_best = np.maximum(future_wholesale, future_afrr_up)
+    future_type = np.where(future_afrr_up > future_wholesale, "afrr_up", "wholesale")
+    future_type[future_best <= -1e20] = "none"
+
+    return {
+        "future_expected_wholesale_value_eur_per_mwh": future_wholesale,
+        "future_expected_afrr_up_value_eur_per_mwh": future_afrr_up,
+        "future_best_market_value_eur_per_mwh": future_best,
+        "future_best_market_type": future_type.astype(object),
+        "forward_horizon_hours": np.full(QH_PER_YEAR, float(inputs.forward_optimization_horizon_hours), dtype=float),
+    }
 
 def build_combined_soc_with_afrr(
     result_hourly: Dict[str, np.ndarray],
@@ -531,6 +592,25 @@ def simulate_afrr_capacity(
         "required_up_soc_reserve_mwh": zero_f.copy(),
         "required_down_soc_headroom_mwh": zero_f.copy(),
         "expected_degradation_cost_eur": zero_f.copy(),
+        "future_best_market_value_eur_per_mwh": zero_f.copy(),
+        "future_best_market_type": none_o.copy(),
+        "cross_market_spread_eur_per_mwh": zero_f.copy(),
+        "required_min_spread_eur_per_mwh": zero_f.copy(),
+        "spread_condition_respected": audit_zero_bool.copy(),
+        "charge_reason": none_o.copy(),
+        "discharge_reason": none_o.copy(),
+        "stored_energy_cost_eur_per_mwh": zero_f.copy(),
+        "effective_discharge_value_eur_per_mwh": zero_f.copy(),
+        "future_expected_afrr_up_value_eur": zero_f.copy(),
+        "future_expected_wholesale_value_eur": zero_f.copy(),
+        "future_expected_best_discharge_market": none_o.copy(),
+        "wholesale_charge_for_future_afrr_flag": audit_zero_bool.copy(),
+        "afrr_down_charge_for_future_wholesale_flag": audit_zero_bool.copy(),
+        "afrr_down_charge_for_future_afrr_up_flag": audit_zero_bool.copy(),
+        "wholesale_discharge_spread_ok": audit_zero_bool.copy(),
+        "afrr_up_discharge_spread_ok": audit_zero_bool.copy(),
+        "forward_horizon_hours": zero_f.copy(),
+        "future_opportunity_selected": audit_zero_bool.copy(),
         "forward_soc_before_capacity_selection_mwh": zero_f.copy(),
         "forward_soc_after_capacity_selection_mwh": zero_f.copy(),
         "afrr_up_soc_feasible": audit_zero_bool.copy(),
@@ -608,6 +688,18 @@ def simulate_afrr_capacity(
     expected_down_capacity = raw_down_capacity * success
     wholesale_expected = np.maximum(wholesale_opportunity, 0.0)
 
+    forward_curves = compute_forward_cross_market_value_curves(inputs)
+    future_best_value = forward_curves["future_best_market_value_eur_per_mwh"]
+    future_best_type = forward_curves["future_best_market_type"]
+    future_wholesale_value = forward_curves["future_expected_wholesale_value_eur_per_mwh"]
+    future_afrr_up_value = forward_curves["future_expected_afrr_up_value_eur_per_mwh"]
+
+    stored_energy_cost_qh = np.zeros(QH_PER_YEAR, dtype=float)
+    if wholesale_reference_result is not None and "avg_stored_charge_price" in wholesale_reference_result:
+        avg_cost = np.asarray(wholesale_reference_result["avg_stored_charge_price"], dtype=float).reshape(-1)
+        if len(avg_cost) >= QH_PER_YEAR:
+            stored_energy_cost_qh = np.nan_to_num(avg_cost[:QH_PER_YEAR], nan=0.0, posinf=0.0, neginf=0.0)
+
     selected = np.full(QH_PER_YEAR, "none", dtype=object)
     selected_market = np.full(QH_PER_YEAR, "none", dtype=object)
     up_awarded = np.zeros(QH_PER_YEAR, dtype=int)
@@ -621,6 +713,18 @@ def simulate_afrr_capacity(
     up_total_value_audit = np.zeros(QH_PER_YEAR, dtype=float)
     down_total_value_audit = np.zeros(QH_PER_YEAR, dtype=float)
     expected_degradation_selected = np.zeros(QH_PER_YEAR, dtype=float)
+    cross_market_spread = np.zeros(QH_PER_YEAR, dtype=float)
+    required_min_spread = np.zeros(QH_PER_YEAR, dtype=float)
+    spread_condition_respected = np.zeros(QH_PER_YEAR, dtype=int)
+    charge_reason = np.full(QH_PER_YEAR, "none", dtype=object)
+    discharge_reason = np.full(QH_PER_YEAR, "none", dtype=object)
+    effective_discharge_value = np.zeros(QH_PER_YEAR, dtype=float)
+    wholesale_charge_for_future_afrr_flag = np.zeros(QH_PER_YEAR, dtype=int)
+    afrr_down_charge_for_future_wholesale_flag = np.zeros(QH_PER_YEAR, dtype=int)
+    afrr_down_charge_for_future_afrr_up_flag = np.zeros(QH_PER_YEAR, dtype=int)
+    wholesale_discharge_spread_ok = np.zeros(QH_PER_YEAR, dtype=int)
+    afrr_up_discharge_spread_ok = np.zeros(QH_PER_YEAR, dtype=int)
+    future_opportunity_selected = np.zeros(QH_PER_YEAR, dtype=int)
 
     forward_soc_before = np.zeros(QH_PER_YEAR, dtype=float)
     forward_soc_after = np.zeros(QH_PER_YEAR, dtype=float)
@@ -664,17 +768,47 @@ def simulate_afrr_capacity(
         up_soc_feasible[t] = int(up_feasible_t)
         down_soc_feasible[t] = int(down_feasible_t)
 
+        stored_cost_per_output_mwh_t = stored_energy_cost_qh[t] / max(inputs.eta_discharge, 1e-12)
+        afrr_up_spread_t = (
+            afrr_up_energy_price[t]
+            - stored_cost_per_output_mwh_t
+            - inputs.afrr_cycle_cost_eur_per_mwh / max(inputs.eta_discharge, 1e-12)
+        )
+        up_spread_ok_t = afrr_up_spread_t + 1e-12 >= inputs.afrr_min_spread_eur_per_mwh
+        afrr_up_discharge_spread_ok[t] = int(up_spread_ok_t)
+
         up_energy_value_t = up_target_t * afrr_up_energy_price[t]
         up_degradation_t = up_target_t / max(inputs.eta_discharge, 1e-12) * inputs.afrr_cycle_cost_eur_per_mwh
         up_total_t = expected_up_capacity[t] + up_energy_value_t - up_degradation_t
+        if not up_spread_ok_t:
+            up_total_t = -1e30
         if not up_feasible_t:
             if up_total_t > max(wholesale_expected[t], 0.0):
                 up_rejected_due_to_soc[t] = 1
             up_total_t = -1e30
 
         # DOWN sign convention: positive DOWN price is a charging cost; negative price is revenue/benefit.
+        # Add cross-market future value: DOWN charge now can be used later for wholesale or aFRR UP discharge.
+        future_output_mwh_t = down_target_t * inputs.eta_charge * inputs.eta_discharge
         down_energy_value_t = -down_target_t * afrr_down_energy_price[t]
-        down_total_t = expected_down_capacity[t] + down_energy_value_t
+        down_future_value_t = 0.0
+        down_required_spread_t = inputs.afrr_min_spread_eur_per_mwh
+        down_spread_t = -1e30
+        if future_best_type[t] == "wholesale":
+            down_required_spread_t = inputs.afrr_down_to_wholesale_min_spread_eur_per_mwh
+        elif future_best_type[t] == "afrr_up":
+            down_required_spread_t = inputs.afrr_min_spread_eur_per_mwh
+        if future_best_value[t] > -1e20 and down_target_t > 1e-12:
+            input_cost_per_future_output = afrr_down_energy_price[t] / max(inputs.eta_charge * inputs.eta_discharge, 1e-12)
+            down_spread_t = future_best_value[t] - input_cost_per_future_output - inputs.afrr_cycle_cost_eur_per_mwh
+            if down_spread_t + 1e-12 >= down_required_spread_t:
+                down_future_value_t = future_output_mwh_t * future_best_value[t]
+                future_opportunity_selected[t] = 1
+                if future_best_type[t] == "wholesale":
+                    afrr_down_charge_for_future_wholesale_flag[t] = 1
+                elif future_best_type[t] == "afrr_up":
+                    afrr_down_charge_for_future_afrr_up_flag[t] = 1
+        down_total_t = expected_down_capacity[t] + down_energy_value_t + down_future_value_t
         if not down_feasible_t:
             if down_total_t > max(wholesale_expected[t], 0.0):
                 down_rejected_due_to_soc[t] = 1
@@ -692,6 +826,11 @@ def simulate_afrr_capacity(
             expected_up_activated[t] = up_target_t
             up_energy_value_selected[t] = up_energy_value_t
             expected_degradation_selected[t] = up_degradation_t
+            cross_market_spread[t] = afrr_up_spread_t
+            required_min_spread[t] = inputs.afrr_min_spread_eur_per_mwh
+            spread_condition_respected[t] = int(up_spread_ok_t)
+            discharge_reason[t] = "afrr_up_capacity_activation_spread_ok"
+            effective_discharge_value[t] = afrr_up_energy_price[t]
             forward_soc_mwh[t + 1] = min(max(soc_now - up_target_t / max(inputs.eta_discharge, 1e-12), min_soc_mwh), max_soc_mwh)
         elif down_total_t == best_val and down_total_t > 0 and down_total_t > wholesale_expected[t] + 1e-9:
             selected[t] = "down"
@@ -699,7 +838,12 @@ def simulate_afrr_capacity(
             down_awarded[t] = 1
             down_revenue[t] = expected_down_capacity[t]
             expected_down_activated[t] = down_target_t
-            down_energy_value_selected[t] = down_energy_value_t
+            down_energy_value_selected[t] = down_energy_value_t + down_future_value_t
+            cross_market_spread[t] = down_spread_t if down_spread_t > -1e20 else 0.0
+            required_min_spread[t] = down_required_spread_t
+            spread_condition_respected[t] = int(down_spread_t + 1e-12 >= down_required_spread_t)
+            charge_reason[t] = "afrr_down_charge_for_future_" + str(future_best_type[t])
+            effective_discharge_value[t] = max(future_best_value[t], 0.0)
             forward_soc_mwh[t + 1] = min(max(soc_now + down_target_t * inputs.eta_charge, min_soc_mwh), max_soc_mwh)
         elif wholesale_expected[t] == best_val and wholesale_expected[t] > 0:
             selected_market[t] = "wholesale"
@@ -744,6 +888,25 @@ def simulate_afrr_capacity(
         "required_up_soc_reserve_mwh": np.full(QH_PER_YEAR, required_up_soc_reserve_mwh, dtype=float),
         "required_down_soc_headroom_mwh": np.full(QH_PER_YEAR, required_down_soc_headroom_mwh, dtype=float),
         "expected_degradation_cost_eur": expected_degradation_selected,
+        "future_best_market_value_eur_per_mwh": future_best_value,
+        "future_best_market_type": future_best_type,
+        "cross_market_spread_eur_per_mwh": cross_market_spread,
+        "required_min_spread_eur_per_mwh": required_min_spread,
+        "spread_condition_respected": spread_condition_respected,
+        "charge_reason": charge_reason,
+        "discharge_reason": discharge_reason,
+        "stored_energy_cost_eur_per_mwh": stored_energy_cost_qh,
+        "effective_discharge_value_eur_per_mwh": effective_discharge_value,
+        "future_expected_afrr_up_value_eur": future_afrr_up_value,
+        "future_expected_wholesale_value_eur": future_wholesale_value,
+        "future_expected_best_discharge_market": future_best_type,
+        "wholesale_charge_for_future_afrr_flag": wholesale_charge_for_future_afrr_flag,
+        "afrr_down_charge_for_future_wholesale_flag": afrr_down_charge_for_future_wholesale_flag,
+        "afrr_down_charge_for_future_afrr_up_flag": afrr_down_charge_for_future_afrr_up_flag,
+        "wholesale_discharge_spread_ok": wholesale_discharge_spread_ok,
+        "afrr_up_discharge_spread_ok": afrr_up_discharge_spread_ok,
+        "forward_horizon_hours": forward_curves["forward_horizon_hours"],
+        "future_opportunity_selected": future_opportunity_selected,
         "forward_soc_before_capacity_selection_mwh": forward_soc_before,
         "forward_soc_after_capacity_selection_mwh": forward_soc_after,
         "afrr_up_soc_feasible": up_soc_feasible,
@@ -1039,9 +1202,13 @@ def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
         j_max = np.searchsorted(soc_grid, min(max_soc_mwh, soc + charge_soc_max), side="right") - 1
         transitions.append(np.arange(j_min, j_max + 1, dtype=int))
 
-    future_best_sell_price_from_t = np.empty(T, dtype=float)
-    future_best_sell_price_from_t[-1] = -1e30
-    future_best_sell_price_from_t[:-1] = np.maximum.accumulate(batt_sell[:0:-1])[::-1]
+    forward_curves_dp = compute_forward_cross_market_value_curves(inputs)
+    future_best_sell_price_from_t = np.maximum(
+        forward_curves_dp["future_expected_wholesale_value_eur_per_mwh"],
+        forward_curves_dp["future_expected_afrr_up_value_eur_per_mwh"],
+    )
+    future_best_market_type_from_t = forward_curves_dp["future_best_market_type"]
+    future_best_sell_price_from_t = np.nan_to_num(future_best_sell_price_from_t, nan=-1e30, posinf=1e30, neginf=-1e30)
     
     def run_dp_once(
         required_discharge_price_estimate: np.ndarray,
@@ -1110,10 +1277,15 @@ def optimize_dispatch_dp(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
                                 continue
                         
                             future_best_sell_price = future_best_sell_price_from_t[t]
+                            future_route = future_best_market_type_from_t[t]
+                            if future_route == "afrr_up":
+                                required_spread = max(inputs.afrr_up_cross_market_min_spread_eur_per_mwh, inputs.afrr_min_spread_eur_per_mwh)
+                            else:
+                                required_spread = inputs.min_spread_arbitrage_eur_per_mwh
                         
                             required_future_sell_price = (
                                 grid_buy_t / max(inputs.eta_charge * inputs.eta_discharge, 1e-12)
-                                + inputs.min_spread_arbitrage_eur_per_mwh
+                                + required_spread
                                 + inputs.cycle_cost_eur_per_mwh
                             )
                         
@@ -2075,6 +2247,11 @@ def reconcile_wholesale_afrr_dispatch_qh(
     selected_charge_price_qh = np.full(QH_PER_YEAR, np.nan, dtype=float)
     selected_discharge_market_qh = np.full(QH_PER_YEAR, "none", dtype=object)
     selected_discharge_price_qh = np.full(QH_PER_YEAR, np.nan, dtype=float)
+    stored_energy_cost_qh = np.nan_to_num(np.asarray(result_hourly.get("avg_stored_charge_price", np.zeros(QH_PER_YEAR + 1)), dtype=float).reshape(-1)[:QH_PER_YEAR], nan=0.0, posinf=0.0, neginf=0.0)
+    effective_discharge_value_qh = np.zeros(QH_PER_YEAR, dtype=float)
+    spread_condition_respected_qh = np.zeros(QH_PER_YEAR, dtype=int)
+    wholesale_discharge_spread_ok_qh = np.zeros(QH_PER_YEAR, dtype=int)
+    afrr_up_discharge_spread_ok_qh = np.zeros(QH_PER_YEAR, dtype=int)
 
     export_limit_qh_mwh = inputs.grid_export_limit_mw * QH_DT_HOURS
     min_soc_mwh = inputs.batt_energy_mwh * inputs.min_soc_pct / 100.0
@@ -2162,6 +2339,25 @@ def reconcile_wholesale_afrr_dispatch_qh(
             scale = max_discharge_output_by_soc / max(total_discharge_output, 1e-12)
             corrected_wholesale_discharge_qh[t] *= scale
             corrected_afrr_discharge_qh[t] *= scale
+
+        # Enforce minimum spread before final discharge into wholesale or aFRR UP.
+        cost_per_output = stored_energy_cost_qh[t] / max(inputs.eta_discharge, 1e-12)
+        wholesale_spread_t = batt_sell_price_qh[t] - cost_per_output - inputs.cycle_cost_eur_per_mwh / max(inputs.eta_discharge, 1e-12)
+        afrr_up_spread_t = afrr_discharge_price_qh[t] - cost_per_output - inputs.afrr_cycle_cost_eur_per_mwh / max(inputs.eta_discharge, 1e-12)
+        if corrected_wholesale_discharge_qh[t] > 1e-12:
+            wholesale_discharge_spread_ok_qh[t] = int(wholesale_spread_t + 1e-12 >= inputs.min_spread_arbitrage_eur_per_mwh)
+            if not wholesale_discharge_spread_ok_qh[t]:
+                corrected_wholesale_discharge_qh[t] = 0.0
+        if corrected_afrr_discharge_qh[t] > 1e-12:
+            afrr_up_discharge_spread_ok_qh[t] = int(afrr_up_spread_t + 1e-12 >= inputs.afrr_min_spread_eur_per_mwh)
+            if not afrr_up_discharge_spread_ok_qh[t]:
+                corrected_afrr_discharge_qh[t] = 0.0
+        if corrected_wholesale_discharge_qh[t] > 1e-12 or corrected_afrr_discharge_qh[t] > 1e-12:
+            spread_condition_respected_qh[t] = 1
+            effective_discharge_value_qh[t] = max(
+                batt_sell_price_qh[t] if corrected_wholesale_discharge_qh[t] > 1e-12 else -1e30,
+                afrr_discharge_price_qh[t] if corrected_afrr_discharge_qh[t] > 1e-12 else -1e30,
+            )
 
         if corrected_afrr_charge_qh[t] > 1e-12:
             selected_charge_market_qh[t] = "afrr"
@@ -2256,6 +2452,11 @@ def reconcile_wholesale_afrr_dispatch_qh(
         "afrr_net_revenue_hourly_eur": corrected_afrr_net_revenue_qh,
         "afrr_energy_down_activated_hourly": down_activated_qh,
         "afrr_energy_up_activated_hourly": up_activated_qh,
+        "stored_energy_cost_eur_per_mwh": stored_energy_cost_qh,
+        "effective_discharge_value_eur_per_mwh": effective_discharge_value_qh,
+        "spread_condition_respected": spread_condition_respected_qh,
+        "wholesale_discharge_spread_ok": wholesale_discharge_spread_ok_qh,
+        "afrr_up_discharge_spread_ok": afrr_up_discharge_spread_ok_qh,
     }
 
 
@@ -2313,6 +2514,15 @@ def build_final_result_after_market_arbitration(
     final["afrr_sale_revenue_hourly_eur"] = reconciliation["afrr_sale_revenue_hourly_eur"]
     final["afrr_cycle_cost_hourly_eur"] = reconciliation["afrr_cycle_cost_hourly_eur"]
     final["afrr_net_revenue_hourly_eur"] = final["afrr_sale_revenue_hourly_eur"] - final["afrr_charge_cost_hourly_eur"]
+    for _audit_key in [
+        "stored_energy_cost_eur_per_mwh",
+        "effective_discharge_value_eur_per_mwh",
+        "spread_condition_respected",
+        "wholesale_discharge_spread_ok",
+        "afrr_up_discharge_spread_ok",
+    ]:
+        if _audit_key in reconciliation:
+            final[_audit_key] = reconciliation[_audit_key]
 
     final["total_afrr_charge_cost_eur"] = np.array([float(reconciliation["afrr_charge_cost_hourly_eur"].sum())])
     final["total_afrr_sale_revenue_eur"] = np.array([float(reconciliation["afrr_sale_revenue_hourly_eur"].sum())])
@@ -2406,6 +2616,25 @@ def add_afrr_capacity_to_final_result(
             "required_up_soc_reserve_mwh",
             "required_down_soc_headroom_mwh",
             "expected_degradation_cost_eur",
+            "future_best_market_value_eur_per_mwh",
+            "future_best_market_type",
+            "cross_market_spread_eur_per_mwh",
+            "required_min_spread_eur_per_mwh",
+            "spread_condition_respected",
+            "charge_reason",
+            "discharge_reason",
+            "stored_energy_cost_eur_per_mwh",
+            "effective_discharge_value_eur_per_mwh",
+            "future_expected_afrr_up_value_eur",
+            "future_expected_wholesale_value_eur",
+            "future_expected_best_discharge_market",
+            "wholesale_charge_for_future_afrr_flag",
+            "afrr_down_charge_for_future_wholesale_flag",
+            "afrr_down_charge_for_future_afrr_up_flag",
+            "wholesale_discharge_spread_ok",
+            "afrr_up_discharge_spread_ok",
+            "forward_horizon_hours",
+            "future_opportunity_selected",
             "forward_soc_before_capacity_selection_mwh",
             "forward_soc_after_capacity_selection_mwh",
             "afrr_up_soc_feasible",
@@ -2417,7 +2646,7 @@ def add_afrr_capacity_to_final_result(
             "afrr_up_rejected_due_to_final_combined_soc",
             "afrr_down_rejected_due_to_final_combined_soc",
         ]:
-            final[_k] = np.asarray(afrr_capacity_result.get(_k, np.zeros(QH_PER_YEAR)), dtype=object if _k in ("selected_market", "selected_capacity_direction") else float)
+            final[_k] = np.asarray(afrr_capacity_result.get(_k, np.full(QH_PER_YEAR, "none", dtype=object) if _k in ("selected_market", "selected_capacity_direction", "future_best_market_type", "charge_reason", "discharge_reason", "future_expected_best_discharge_market") else np.zeros(QH_PER_YEAR)), dtype=object if _k in ("selected_market", "selected_capacity_direction", "future_best_market_type", "charge_reason", "discharge_reason", "future_expected_best_discharge_market") else float)
 
     final["total_afrr_capacity_up_revenue_eur"] = np.array([cap_up_total])
     final["total_afrr_capacity_down_revenue_eur"] = np.array([cap_down_total])
@@ -2692,6 +2921,9 @@ def build_inputs_dataframe(inputs: SimulationInputs) -> pd.DataFrame:
         ("discharge_quantile", inputs.discharge_quantile),
         ("max_cycles_per_year", inputs.max_cycles_per_year),
         ("min_spread_arbitrage_eur_per_mwh", inputs.min_spread_arbitrage_eur_per_mwh),
+        ("forward_optimization_horizon_hours", inputs.forward_optimization_horizon_hours),
+        ("afrr_up_cross_market_min_spread_eur_per_mwh", inputs.afrr_up_cross_market_min_spread_eur_per_mwh),
+        ("afrr_down_to_wholesale_min_spread_eur_per_mwh", inputs.afrr_down_to_wholesale_min_spread_eur_per_mwh),
         ("pv_capture_rate_pct", inputs.pv_capture_rate_pct),
         ("bess_capture_rate_pct", inputs.bess_capture_rate_pct),
         ("enable_afrr", inputs.enable_afrr),
@@ -3005,6 +3237,9 @@ def app():
     afrr_max_events_per_day = 1
     afrr_energy_down_activation_pct = 100.0
     afrr_energy_up_activation_pct = 100.0
+    forward_optimization_horizon_hours = 24.0
+    afrr_up_cross_market_min_spread = 20.0
+    afrr_down_to_wholesale_min_spread = 20.0
     afrr_charge_source = "Upload prix aFRR charge Excel/CSV (35040 lignes)"
     afrr_discharge_source = "Upload prix aFRR décharge Excel/CSV (35040 lignes)"
 
@@ -3032,6 +3267,9 @@ def app():
 
         with c_afrr3:
             st.info("Phase 1: aFRR Energy is eligible at any 15-minute timestep. Night filters were removed.")
+            forward_optimization_horizon_hours = st.slider("Forward Optimization Horizon (hours)", min_value=1, max_value=72, value=24, step=1)
+            afrr_up_cross_market_min_spread = st.number_input("Minimum Spread Wholesale Charge → aFRR UP Discharge (€/MWh)", min_value=0.0, value=20.0, step=1.0)
+            afrr_down_to_wholesale_min_spread = st.number_input("Minimum Spread aFRR DOWN Charge → Wholesale Discharge (€/MWh)", min_value=0.0, value=20.0, step=1.0)
             afrr_max_events_per_day = st.number_input("Nombre max d'événements aFRR / jour (legacy, not used in Phase 1 capacity mode)", min_value=1, value=1, step=1)
 
     st.markdown("---")
@@ -3333,6 +3571,9 @@ def app():
             discharge_quantile=discharge_quantile,
             max_cycles_per_year=max_cycles_per_year,
             min_spread_arbitrage_eur_per_mwh=min_spread_arbitrage,
+            forward_optimization_horizon_hours=float(forward_optimization_horizon_hours),
+            afrr_up_cross_market_min_spread_eur_per_mwh=float(afrr_up_cross_market_min_spread),
+            afrr_down_to_wholesale_min_spread_eur_per_mwh=float(afrr_down_to_wholesale_min_spread),
             pv_capture_rate_pct=pv_capture_rate_pct,
             bess_capture_rate_pct=bess_capture_rate_pct,
             enable_afrr=enable_afrr,
@@ -3758,6 +3999,25 @@ def app():
             "required_up_soc_reserve_mwh": final_result.get("required_up_soc_reserve_mwh", np.zeros(QH_PER_YEAR)),
             "required_down_soc_headroom_mwh": final_result.get("required_down_soc_headroom_mwh", np.zeros(QH_PER_YEAR)),
             "expected_degradation_cost_eur": final_result.get("expected_degradation_cost_eur", np.zeros(QH_PER_YEAR)),
+            "future_best_market_value_eur_per_mwh": final_result.get("future_best_market_value_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+            "future_best_market_type": final_result.get("future_best_market_type", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "cross_market_spread_eur_per_mwh": final_result.get("cross_market_spread_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+            "required_min_spread_eur_per_mwh": final_result.get("required_min_spread_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+            "spread_condition_respected": final_result.get("spread_condition_respected", np.zeros(QH_PER_YEAR)),
+            "charge_reason": final_result.get("charge_reason", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "discharge_reason": final_result.get("discharge_reason", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "stored_energy_cost_eur_per_mwh": final_result.get("stored_energy_cost_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+            "effective_discharge_value_eur_per_mwh": final_result.get("effective_discharge_value_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+            "future_expected_afrr_up_value_eur": final_result.get("future_expected_afrr_up_value_eur", np.zeros(QH_PER_YEAR)),
+            "future_expected_wholesale_value_eur": final_result.get("future_expected_wholesale_value_eur", np.zeros(QH_PER_YEAR)),
+            "future_expected_best_discharge_market": final_result.get("future_expected_best_discharge_market", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "wholesale_charge_for_future_afrr_flag": final_result.get("wholesale_charge_for_future_afrr_flag", np.zeros(QH_PER_YEAR)),
+            "afrr_down_charge_for_future_wholesale_flag": final_result.get("afrr_down_charge_for_future_wholesale_flag", np.zeros(QH_PER_YEAR)),
+            "afrr_down_charge_for_future_afrr_up_flag": final_result.get("afrr_down_charge_for_future_afrr_up_flag", np.zeros(QH_PER_YEAR)),
+            "wholesale_discharge_spread_ok": final_result.get("wholesale_discharge_spread_ok", np.zeros(QH_PER_YEAR)),
+            "afrr_up_discharge_spread_ok": final_result.get("afrr_up_discharge_spread_ok", np.zeros(QH_PER_YEAR)),
+            "forward_horizon_hours": final_result.get("forward_horizon_hours", np.zeros(QH_PER_YEAR)),
+            "future_opportunity_selected": final_result.get("future_opportunity_selected", np.zeros(QH_PER_YEAR)),
             "forward_soc_before_capacity_selection_mwh": final_result.get("forward_soc_before_capacity_selection_mwh", np.zeros(QH_PER_YEAR)),
             "forward_soc_after_capacity_selection_mwh": final_result.get("forward_soc_after_capacity_selection_mwh", np.zeros(QH_PER_YEAR)),
             "afrr_up_soc_feasible": final_result.get("afrr_up_soc_feasible", np.zeros(QH_PER_YEAR)),
@@ -3808,6 +4068,11 @@ def app():
                 "selected_discharge_channel": reconciliation["selected_discharge_channel_qh"],
                 "selected_discharge_market": reconciliation["selected_discharge_market_qh"],
                 "selected_discharge_price_eur_per_mwh": reconciliation["selected_discharge_price_qh"],
+                "stored_energy_cost_eur_per_mwh": reconciliation.get("stored_energy_cost_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+                "effective_discharge_value_eur_per_mwh": reconciliation.get("effective_discharge_value_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+                "spread_condition_respected": reconciliation.get("spread_condition_respected", np.zeros(QH_PER_YEAR)),
+                "wholesale_discharge_spread_ok": reconciliation.get("wholesale_discharge_spread_ok", np.zeros(QH_PER_YEAR)),
+                "afrr_up_discharge_spread_ok": reconciliation.get("afrr_up_discharge_spread_ok", np.zeros(QH_PER_YEAR)),
                 "afrr_capacity_selected_market": reconciliation["afrr_capacity_selected_market_qh"],
                 "combined_soc_mwh": reconciliation["combined_soc_qh"][1:],
                 "afrr_charge_cost_eur": reconciliation["afrr_charge_cost_qh_eur"],
@@ -3855,6 +4120,25 @@ def app():
             "required_up_soc_reserve_mwh": final_result.get("required_up_soc_reserve_mwh", np.zeros(QH_PER_YEAR)),
             "required_down_soc_headroom_mwh": final_result.get("required_down_soc_headroom_mwh", np.zeros(QH_PER_YEAR)),
             "expected_degradation_cost_eur": final_result.get("expected_degradation_cost_eur", np.zeros(QH_PER_YEAR)),
+            "future_best_market_value_eur_per_mwh": final_result.get("future_best_market_value_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+            "future_best_market_type": final_result.get("future_best_market_type", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "cross_market_spread_eur_per_mwh": final_result.get("cross_market_spread_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+            "required_min_spread_eur_per_mwh": final_result.get("required_min_spread_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+            "spread_condition_respected": final_result.get("spread_condition_respected", np.zeros(QH_PER_YEAR)),
+            "charge_reason": final_result.get("charge_reason", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "discharge_reason": final_result.get("discharge_reason", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "stored_energy_cost_eur_per_mwh": final_result.get("stored_energy_cost_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+            "effective_discharge_value_eur_per_mwh": final_result.get("effective_discharge_value_eur_per_mwh", np.zeros(QH_PER_YEAR)),
+            "future_expected_afrr_up_value_eur": final_result.get("future_expected_afrr_up_value_eur", np.zeros(QH_PER_YEAR)),
+            "future_expected_wholesale_value_eur": final_result.get("future_expected_wholesale_value_eur", np.zeros(QH_PER_YEAR)),
+            "future_expected_best_discharge_market": final_result.get("future_expected_best_discharge_market", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "wholesale_charge_for_future_afrr_flag": final_result.get("wholesale_charge_for_future_afrr_flag", np.zeros(QH_PER_YEAR)),
+            "afrr_down_charge_for_future_wholesale_flag": final_result.get("afrr_down_charge_for_future_wholesale_flag", np.zeros(QH_PER_YEAR)),
+            "afrr_down_charge_for_future_afrr_up_flag": final_result.get("afrr_down_charge_for_future_afrr_up_flag", np.zeros(QH_PER_YEAR)),
+            "wholesale_discharge_spread_ok": final_result.get("wholesale_discharge_spread_ok", np.zeros(QH_PER_YEAR)),
+            "afrr_up_discharge_spread_ok": final_result.get("afrr_up_discharge_spread_ok", np.zeros(QH_PER_YEAR)),
+            "forward_horizon_hours": final_result.get("forward_horizon_hours", np.zeros(QH_PER_YEAR)),
+            "future_opportunity_selected": final_result.get("future_opportunity_selected", np.zeros(QH_PER_YEAR)),
             "forward_soc_before_capacity_selection_mwh": final_result.get("forward_soc_before_capacity_selection_mwh", np.zeros(QH_PER_YEAR)),
             "forward_soc_after_capacity_selection_mwh": final_result.get("forward_soc_after_capacity_selection_mwh", np.zeros(QH_PER_YEAR)),
             "afrr_up_soc_feasible": final_result.get("afrr_up_soc_feasible", np.zeros(QH_PER_YEAR)),
