@@ -2382,11 +2382,11 @@ def app():
         st.caption(f"Effective BESS usable capacity: {effective_batt_energy_mwh:.2f} MWh")
         eta_charge = st.number_input("BESS Charging Efficiency (%)", min_value=1.0, max_value=100.0, value=95.0, step=0.5) / 100.0
         eta_discharge = st.number_input("BESS Discharging Efficiency (%)", min_value=1.0, max_value=100.0, value=95.0, step=0.5) / 100.0
-        min_soc_pct = st.slider("BESS Minimum SOC (%)", 0, 100, 20)
-        max_soc_pct = st.slider("BESS Maximum SOC (%)", 0, 100, 90)
+        min_soc_pct = st.slider("BESS Minimum SOC (%)", 0, 100, 0)
+        max_soc_pct = st.slider("BESS Maximum SOC (%)", 0, 100, 100)
         initial_soc = st.number_input("BESS BoL SOC (MWh)", min_value=0.0, value=effective_batt_energy_mwh*max_soc_pct/100, step=1.0)
         final_soc = st.number_input("BESS EoL SOC (MWh)", min_value=0.0, value=effective_batt_energy_mwh*min_soc_pct/100, step=1.0)
-        bess_capture_rate_pct = st.number_input("BESS Capture Rate (%)", min_value=0.0, max_value=100.0, value=100.0, step=1.0)
+        bess_capture_rate_pct = st.number_input("BESS Capture Rate (%)", min_value=0.0, max_value=100.0, value=85.0, step=1.0)
         max_cycles_per_year = st.number_input("Max Cycles / year", min_value=0.0, value=547.0, step=0.1)
         cycle_cost = st.number_input("BESS Cycle Cost (EUR/MWh)", value=0.0)
         charge_quantile = st.slider("Charge Percentile (%)", 0, 100, 100)
@@ -2406,7 +2406,7 @@ def app():
         st.subheader("General Parameters")
         project_lifetime_years = int(st.number_input("Project Lifetime (years)", min_value=1, value=1, step=1))
         grid_export_limit_mw = st.number_input("Grid Injection Limit (MW)", min_value=0.0, value=100.0, step=1.0)
-        soc_steps = st.slider("SOC Steps for Optimization", min_value=21, max_value=201, value=51, step=10)
+        soc_steps = st.slider("SOC Steps for Optimization", min_value=21, max_value=201, value=21, step=10)
 
     bess_degradation_upload = st.file_uploader(
             "BESS Degradation Curve",
