@@ -95,10 +95,9 @@ class SimulationInputs:
     afrr_capacity_up_price_h: np.ndarray | None = None
     afrr_capacity_down_price_h: np.ndarray | None = None
     afrr_certified_capacity_pct: float = 100.0
-    afrr_capacity_start_hour: int = 20
-    afrr_capacity_end_hour: int = 8
-    afrr_capacity_min_price_up_eur_per_mw_h: float = 0.0
-    afrr_capacity_min_price_down_eur_per_mw_h: float = 0.0
+    afrr_capacity_success_rate_pct: float = 80.0
+    afrr_capacity_start_hour: int = 0
+    afrr_capacity_end_hour: int = 0
     allow_afrr_energy_without_capacity: bool = True
     afrr_certified_capacity_up_mw: float = 0.0
     afrr_certified_capacity_down_mw: float = 0.0
@@ -474,62 +473,175 @@ def read_afrr_capacity_csv(uploaded_file, year: int) -> np.ndarray:
 
     return values
     
-def simulate_afrr_capacity(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
-    """Simulate hourly aFRR Capacity awards and revenues.
+def simulate_afrr_capacity(
+    inputs: SimulationInputs,
+    wholesale_reference_result: Dict[str, np.ndarray] | None = None,
+) -> Dict[str, np.ndarray]:
+    """Phase 1 aFRR capacity co-optimization at 15-minute resolution.
 
-    Capacity reserves availability only: it creates revenue and blocks battery wholesale
-    activity in awarded hours, but it does not move SOC.
+    Exclusive market selection: for each 15-minute timestep the battery chooses
+    either wholesale, aFRR UP capacity + expected UP energy, aFRR DOWN capacity +
+    expected DOWN energy, or no battery market action. Partial MW allocation is
+    deliberately not implemented here; the returned arrays are structured so a
+    later LP/MILP phase can add partial allocation.
     """
-    idx_hourly = build_quarter_hour_index(DEFAULT_YEAR)
+    zero_f = np.zeros(QH_PER_YEAR, dtype=float)
+    zero_i = np.zeros(QH_PER_YEAR, dtype=int)
+    none_o = np.full(QH_PER_YEAR, "none", dtype=object)
+
+    base_return = {
+        "afrr_capacity_up_awarded_h": zero_i.copy(),
+        "afrr_capacity_down_awarded_h": zero_i.copy(),
+        "afrr_capacity_selected_market_h": none_o.copy(),
+        "afrr_capacity_up_revenue_h_eur": zero_f.copy(),
+        "afrr_capacity_down_revenue_h_eur": zero_f.copy(),
+        "afrr_capacity_total_revenue_h_eur": zero_f.copy(),
+        "afrr_capacity_eligible_h": zero_i.copy(),
+        "afrr_certified_capacity_up_mw_h": zero_f.copy(),
+        "afrr_certified_capacity_down_mw_h": zero_f.copy(),
+        "wholesale_opportunity_value_eur": zero_f.copy(),
+        "wholesale_expected_value_after_capture_rate_eur": zero_f.copy(),
+        "raw_up_capacity_revenue_eur": zero_f.copy(),
+        "expected_up_capacity_revenue_eur": zero_f.copy(),
+        "raw_down_capacity_revenue_eur": zero_f.copy(),
+        "expected_down_capacity_revenue_eur": zero_f.copy(),
+        "expected_up_activated_mwh": zero_f.copy(),
+        "expected_down_activated_mwh": zero_f.copy(),
+        "afrr_up_energy_expected_value_eur": zero_f.copy(),
+        "afrr_down_energy_expected_value_eur": zero_f.copy(),
+        "afrr_up_total_expected_value_eur": zero_f.copy(),
+        "afrr_down_total_expected_value_eur": zero_f.copy(),
+        "selected_market": none_o.copy(),
+        "selected_capacity_direction": none_o.copy(),
+        "afrr_capacity_success_rate_pct": np.full(QH_PER_YEAR, float(inputs.afrr_capacity_success_rate_pct), dtype=float),
+        "bess_wholesale_capture_rate_pct": np.full(QH_PER_YEAR, float(inputs.bess_capture_rate_pct), dtype=float),
+        "afrr_up_activation_pct": np.full(QH_PER_YEAR, float(inputs.afrr_energy_up_activation_pct), dtype=float),
+        "afrr_down_activation_pct": np.full(QH_PER_YEAR, float(inputs.afrr_energy_down_activation_pct), dtype=float),
+        "available_export_headroom_mwh": zero_f.copy(),
+        "available_soc_headroom_mwh": zero_f.copy(),
+        "available_discharge_from_soc_mwh": zero_f.copy(),
+        "required_up_soc_reserve_mwh": zero_f.copy(),
+        "required_down_soc_headroom_mwh": zero_f.copy(),
+        "expected_degradation_cost_eur": zero_f.copy(),
+    }
 
     if not inputs.enable_afrr_capacity:
-        return {
-            "afrr_capacity_up_awarded_h": np.zeros(QH_PER_YEAR, dtype=int),
-            "afrr_capacity_down_awarded_h": np.zeros(QH_PER_YEAR, dtype=int),
-            "afrr_capacity_selected_market_h": np.full(QH_PER_YEAR, "none", dtype=object),
-            "afrr_capacity_up_revenue_h_eur": np.zeros(QH_PER_YEAR, dtype=float),
-            "afrr_capacity_down_revenue_h_eur": np.zeros(QH_PER_YEAR, dtype=float),
-            "afrr_capacity_total_revenue_h_eur": np.zeros(QH_PER_YEAR, dtype=float),
-            "afrr_capacity_eligible_h": np.zeros(QH_PER_YEAR, dtype=int),
-            "afrr_certified_capacity_up_mw_h": np.zeros(QH_PER_YEAR, dtype=float),
-            "afrr_certified_capacity_down_mw_h": np.zeros(QH_PER_YEAR, dtype=float),
-        }
-
+        return base_return
     if inputs.afrr_capacity_up_price_h is None or inputs.afrr_capacity_down_price_h is None:
-        raise ValueError("Les deux courbes Excel aFRR Capacity UP et Down doivent être fournies.")
+        raise ValueError("Les deux courbes aFRR Capacity UP et Down doivent être fournies.")
 
     up_price = _validate_array_length(inputs.afrr_capacity_up_price_h, "Prix aFRR Capacity UP", QH_PER_YEAR)
     down_price = _validate_array_length(inputs.afrr_capacity_down_price_h, "Prix aFRR Capacity Down", QH_PER_YEAR)
 
+    if inputs.afrr_charge_price_qh is None:
+        afrr_down_energy_price = np.zeros(QH_PER_YEAR, dtype=float)
+    else:
+        afrr_down_energy_price = _validate_array_length(inputs.afrr_charge_price_qh, "Prix aFRR Down Energy", QH_PER_YEAR)
+    if inputs.afrr_discharge_price_qh is None:
+        afrr_up_energy_price = np.zeros(QH_PER_YEAR, dtype=float)
+    else:
+        afrr_up_energy_price = _validate_array_length(inputs.afrr_discharge_price_qh, "Prix aFRR Up Energy", QH_PER_YEAR)
+
     if not (0.0 <= inputs.afrr_certified_capacity_pct <= 100.0):
         raise ValueError("% of Certified Capacity for aFRR doit être compris entre 0 et 100 %.")
+    if not (0.0 <= inputs.afrr_capacity_success_rate_pct <= 100.0):
+        raise ValueError("aFRR Capacity Bid Success Rate (%) doit être compris entre 0 et 100 %.")
 
-    eligible = build_hour_mask(idx_hourly, inputs.afrr_capacity_start_hour, inputs.afrr_capacity_end_hour)
+    success = float(inputs.afrr_capacity_success_rate_pct) / 100.0
+    activation_up = min(max(float(inputs.afrr_energy_up_activation_pct) / 100.0, 0.0), 1.0)
+    activation_down = min(max(float(inputs.afrr_energy_down_activation_pct) / 100.0, 0.0), 1.0)
 
     certified_up = float(inputs.afrr_certified_capacity_up_mw)
     certified_down = float(inputs.afrr_certified_capacity_down_mw)
 
-    up_revenue_candidate = up_price * certified_up
-    down_revenue_candidate = down_price * certified_down
+    pv_direct = np.zeros(QH_PER_YEAR, dtype=float)
+    soc_start = np.full(QH_PER_YEAR, float(inputs.initial_soc_mwh), dtype=float)
+    wholesale_opportunity = np.zeros(QH_PER_YEAR, dtype=float)
 
-    up_ok = eligible & (up_price >= inputs.afrr_capacity_min_price_up_eur_per_mw_h)
-    down_ok = eligible & (down_price >= inputs.afrr_capacity_min_price_down_eur_per_mw_h)
+    if wholesale_reference_result is not None:
+        pv_direct = _validate_array_length(wholesale_reference_result.get("pv_direct", pv_direct), "PV direct référence wholesale", QH_PER_YEAR)
+        soc_curve = np.asarray(wholesale_reference_result.get("soc", np.r_[soc_start, soc_start[-1]]), dtype=float).reshape(-1)
+        if len(soc_curve) >= QH_PER_YEAR + 1:
+            soc_start = soc_curve[:-1]
+        batt_sale = np.asarray(wholesale_reference_result.get("batt_sale_revenue", zero_f), dtype=float).reshape(-1)
+        grid_cost = np.asarray(wholesale_reference_result.get("grid_charge_cost", zero_f), dtype=float).reshape(-1)
+        pv_to_batt = np.asarray(wholesale_reference_result.get("pv_to_batt", zero_f), dtype=float).reshape(-1)
+        curtailed_to_batt = np.asarray(wholesale_reference_result.get("pv_curtailed_to_battery", zero_f), dtype=float).reshape(-1)
+        discharge = np.asarray(wholesale_reference_result.get("discharge", zero_f), dtype=float).reshape(-1)
+        # Practical Phase-1 approximation: use the realized value of the baseline
+        # DP wholesale action as the marginal opportunity reference. This is not a
+        # full shadow price extraction, but it avoids comparing aFRR only to the
+        # current DA price and keeps the code compatible with the existing DP.
+        future_best_sell = np.maximum.accumulate(np.asarray(inputs.batt_sell_price, dtype=float)[::-1])[::-1]
+        charge_future_value = (pv_to_batt + curtailed_to_batt) * np.maximum(future_best_sell * inputs.eta_charge * inputs.eta_discharge - inputs.pv_price, 0.0)
+        discharge_value = np.maximum(batt_sale - discharge * inputs.cycle_cost_eur_per_mwh, 0.0)
+        grid_charge_value = np.maximum((future_best_sell * inputs.eta_charge * inputs.eta_discharge - inputs.grid_buy_price) * np.asarray(wholesale_reference_result.get("grid_charge", zero_f), dtype=float), 0.0)
+        wholesale_opportunity = np.maximum.reduce([discharge_value, charge_future_value, grid_charge_value, np.zeros(QH_PER_YEAR)])
+
+    min_soc_mwh = inputs.batt_energy_mwh * inputs.min_soc_pct / 100.0
+    max_soc_mwh = inputs.batt_energy_mwh * inputs.max_soc_pct / 100.0
+    export_limit_qh = inputs.grid_export_limit_mw * QH_DT_HOURS
+
+    available_export_headroom = np.maximum(export_limit_qh - pv_direct, 0.0)
+    available_soc_headroom_input = np.maximum(max_soc_mwh - soc_start, 0.0) / max(inputs.eta_charge, 1e-12)
+    available_discharge_output = np.maximum(soc_start - min_soc_mwh, 0.0) * inputs.eta_discharge
+
+    required_up_soc_reserve_mwh = certified_up * QH_DT_HOURS * activation_up
+    required_down_soc_headroom_mwh = certified_down * QH_DT_HOURS * activation_down
+
+    possible_up_activated_mwh = np.minimum.reduce([
+        np.full(QH_PER_YEAR, certified_up * QH_DT_HOURS * activation_up, dtype=float),
+        available_discharge_output,
+        available_export_headroom,
+    ])
+    possible_down_activated_mwh = np.minimum.reduce([
+        np.full(QH_PER_YEAR, certified_down * QH_DT_HOURS * activation_down, dtype=float),
+        available_soc_headroom_input,
+    ])
+
+    up_feasible = (
+        certified_up > 0
+        and activation_up >= 0
+    ) and (available_discharge_output + 1e-12 >= required_up_soc_reserve_mwh) & (available_export_headroom + 1e-12 >= required_up_soc_reserve_mwh)
+    down_feasible = (
+        certified_down > 0
+        and activation_down >= 0
+    ) and (available_soc_headroom_input + 1e-12 >= required_down_soc_headroom_mwh)
+
+    raw_up_capacity = up_price * certified_up * QH_DT_HOURS
+    raw_down_capacity = down_price * certified_down * QH_DT_HOURS
+    expected_up_capacity = raw_up_capacity * success
+    expected_down_capacity = raw_down_capacity * success
+
+    expected_up_energy_revenue = possible_up_activated_mwh * afrr_up_energy_price
+    expected_up_degradation = possible_up_activated_mwh / max(inputs.eta_discharge, 1e-12) * inputs.afrr_cycle_cost_eur_per_mwh
+    afrr_up_total = expected_up_capacity + expected_up_energy_revenue - expected_up_degradation
+
+    # DOWN sign convention: positive DOWN price is a charging cost; negative price is revenue/benefit.
+    expected_down_energy_value = -possible_down_activated_mwh * afrr_down_energy_price
+    afrr_down_total = expected_down_capacity + expected_down_energy_value
+
+    afrr_up_total = np.where(up_feasible, afrr_up_total, -1e30)
+    afrr_down_total = np.where(down_feasible, afrr_down_total, -1e30)
+    wholesale_expected = np.maximum(wholesale_opportunity, 0.0)  # already based on effective prices/capture rate
 
     selected = np.full(QH_PER_YEAR, "none", dtype=object)
-    select_up = up_ok & ~down_ok
-    select_down = down_ok & ~up_ok
-    both = up_ok & down_ok
-
-    select_up |= both & (up_revenue_candidate >= down_revenue_candidate)
-    select_down |= both & (down_revenue_candidate > up_revenue_candidate)
+    selected_market = np.full(QH_PER_YEAR, "none", dtype=object)
+    best_val = np.maximum.reduce([wholesale_expected, afrr_up_total, afrr_down_total, np.zeros(QH_PER_YEAR)])
+    select_up = (afrr_up_total == best_val) & (afrr_up_total > 0) & (afrr_up_total > wholesale_expected + 1e-9)
+    select_down = (afrr_down_total == best_val) & (afrr_down_total > 0) & (afrr_down_total > wholesale_expected + 1e-9)
+    select_wholesale = (wholesale_expected == best_val) & (wholesale_expected > 0) & ~(select_up | select_down)
 
     selected[select_up] = "up"
     selected[select_down] = "down"
+    selected_market[select_wholesale] = "wholesale"
+    selected_market[select_up] = "afrr_up_capacity"
+    selected_market[select_down] = "afrr_down_capacity"
 
     up_awarded = (selected == "up").astype(int)
     down_awarded = (selected == "down").astype(int)
-    up_revenue = up_price * certified_up * QH_DT_HOURS * up_awarded
-    down_revenue = down_price * certified_down * QH_DT_HOURS * down_awarded
+    up_revenue = expected_up_capacity * up_awarded
+    down_revenue = expected_down_capacity * down_awarded
 
     return {
         "afrr_capacity_up_awarded_h": up_awarded,
@@ -538,11 +650,34 @@ def simulate_afrr_capacity(inputs: SimulationInputs) -> Dict[str, np.ndarray]:
         "afrr_capacity_up_revenue_h_eur": up_revenue,
         "afrr_capacity_down_revenue_h_eur": down_revenue,
         "afrr_capacity_total_revenue_h_eur": up_revenue + down_revenue,
-        "afrr_capacity_eligible_h": eligible.astype(int),
+        "afrr_capacity_eligible_h": np.ones(QH_PER_YEAR, dtype=int),
         "afrr_certified_capacity_up_mw_h": np.full(QH_PER_YEAR, certified_up, dtype=float),
         "afrr_certified_capacity_down_mw_h": np.full(QH_PER_YEAR, certified_down, dtype=float),
+        "wholesale_opportunity_value_eur": wholesale_opportunity,
+        "wholesale_expected_value_after_capture_rate_eur": wholesale_expected,
+        "raw_up_capacity_revenue_eur": raw_up_capacity,
+        "expected_up_capacity_revenue_eur": expected_up_capacity,
+        "raw_down_capacity_revenue_eur": raw_down_capacity,
+        "expected_down_capacity_revenue_eur": expected_down_capacity,
+        "expected_up_activated_mwh": possible_up_activated_mwh * up_awarded,
+        "expected_down_activated_mwh": possible_down_activated_mwh * down_awarded,
+        "afrr_up_energy_expected_value_eur": expected_up_energy_revenue * up_awarded,
+        "afrr_down_energy_expected_value_eur": expected_down_energy_value * down_awarded,
+        "afrr_up_total_expected_value_eur": np.where(np.isfinite(afrr_up_total), afrr_up_total, 0.0),
+        "afrr_down_total_expected_value_eur": np.where(np.isfinite(afrr_down_total), afrr_down_total, 0.0),
+        "selected_market": selected_market,
+        "selected_capacity_direction": selected,
+        "afrr_capacity_success_rate_pct": np.full(QH_PER_YEAR, float(inputs.afrr_capacity_success_rate_pct), dtype=float),
+        "bess_wholesale_capture_rate_pct": np.full(QH_PER_YEAR, float(inputs.bess_capture_rate_pct), dtype=float),
+        "afrr_up_activation_pct": np.full(QH_PER_YEAR, float(inputs.afrr_energy_up_activation_pct), dtype=float),
+        "afrr_down_activation_pct": np.full(QH_PER_YEAR, float(inputs.afrr_energy_down_activation_pct), dtype=float),
+        "available_export_headroom_mwh": available_export_headroom,
+        "available_soc_headroom_mwh": available_soc_headroom_input,
+        "available_discharge_from_soc_mwh": available_discharge_output,
+        "required_up_soc_reserve_mwh": np.full(QH_PER_YEAR, required_up_soc_reserve_mwh, dtype=float),
+        "required_down_soc_headroom_mwh": np.full(QH_PER_YEAR, required_down_soc_headroom_mwh, dtype=float),
+        "expected_degradation_cost_eur": expected_up_degradation * up_awarded,
     }
-
 
 def build_standard_france_solar_profile() -> np.ndarray:
     idx = build_quarter_hour_index(DEFAULT_YEAR)
@@ -1438,9 +1573,9 @@ def simulate_afrr_night_arbitrage(inputs: SimulationInputs, result_hourly: Dict[
     idx_qh = build_quarter_hour_index(DEFAULT_YEAR)
     pv_qh = _validate_array_length(inputs.solar_profile, "Production PV nette quart-horaire", QH_PER_YEAR)
 
-    night_mask_qh = build_night_mask_qh(idx_qh, inputs.afrr_night_start_hour, inputs.afrr_night_end_hour)
-    no_pv_mask_qh = pv_qh <= float(inputs.afrr_pv_zero_tolerance_mwh)
-    eligible_mask_qh = night_mask_qh & no_pv_mask_qh
+    # Phase 1: aFRR Energy is eligible at any 15-minute timestep.
+    # Do not restrict to night hours and do not block DOWN activation during PV production.
+    eligible_mask_qh = np.ones(QH_PER_YEAR, dtype=bool)
 
     afrr_charge_qh_mwh = np.zeros(QH_PER_YEAR, dtype=float)
     afrr_discharge_qh_mwh = np.zeros(QH_PER_YEAR, dtype=float)
@@ -1471,24 +1606,21 @@ def simulate_afrr_night_arbitrage(inputs: SimulationInputs, result_hourly: Dict[
             if len(capacity_selected_h) != QH_PER_YEAR:
                 raise ValueError("La courbe de sélection aFRR Capacity doit contenir 35040 pas de 15 minutes.")
 
-        down_selected_qh = _select_hourly_activation_by_pct(
-            capacity_selected_h == "down",
-            charge_prices_qh,
-            inputs.afrr_energy_down_activation_pct,
-            prefer="low",
-        ).astype(bool)
-        up_selected_qh = _select_hourly_activation_by_pct(
-            capacity_selected_h == "up",
-            discharge_prices_qh,
-            inputs.afrr_energy_up_activation_pct,
-            prefer="high",
-        ).astype(bool)
+        # Capacity-linked aFRR energy is represented as expected activated MWh on every awarded interval.
+        # Activation percentages scale MWh, not the number of selected intervals.
+        down_selected_qh = (capacity_selected_h == "down")
+        up_selected_qh = (capacity_selected_h == "up")
         down_selected_h = down_selected_qh.astype(int)
         up_selected_h = up_selected_qh.astype(int)
+        activation_down_factor = min(max(float(inputs.afrr_energy_down_activation_pct) / 100.0, 0.0), 1.0)
+        activation_up_factor = min(max(float(inputs.afrr_energy_up_activation_pct) / 100.0, 0.0), 1.0)
 
         for t in range(QH_PER_YEAR):
             if down_selected_qh[t]:
-                input_this_qh = min(max_charge_input_qh, max(max_soc_mwh - soc_current, 0.0) / max(inputs.eta_charge, 1e-12))
+                input_this_qh = min(
+                    max_charge_input_qh * activation_down_factor,
+                    max(max_soc_mwh - soc_current, 0.0) / max(inputs.eta_charge, 1e-12),
+                )
                 if input_this_qh > 1e-12:
                     afrr_charge_qh_mwh[t] = input_this_qh
                     afrr_charge_cost_qh_eur[t] = input_this_qh * charge_prices_qh[t]
@@ -1497,9 +1629,11 @@ def simulate_afrr_night_arbitrage(inputs: SimulationInputs, result_hourly: Dict[
                     down_activated_qh[t] = 1
                     selected_charge_market_qh[t] = "afrr"
             elif up_selected_qh[t]:
+                pv_direct_t = float(np.asarray(result_hourly.get("pv_direct", np.zeros(QH_PER_YEAR)), dtype=float)[t])
+                export_room_t = max(max_export_qh - pv_direct_t, 0.0)
                 discharge_this_qh = min(
-                    max_discharge_output_qh,
-                    max_export_qh,
+                    max_discharge_output_qh * activation_up_factor,
+                    export_room_t,
                     max(soc_current - min_soc_mwh, 0.0) * inputs.eta_discharge,
                 )
                 if discharge_this_qh > 1e-12:
@@ -1592,9 +1726,11 @@ def simulate_afrr_night_arbitrage(inputs: SimulationInputs, result_hourly: Dict[
 
                 for rel_idx in [int(i) for i in best_trade["discharge_indices"]]:
                     t = int(group_idx[rel_idx])
+                    pv_direct_t = float(np.asarray(result_hourly.get("pv_direct", np.zeros(QH_PER_YEAR)), dtype=float)[t])
+                    export_room_t = max(max_export_qh - pv_direct_t, 0.0)
                     discharge_this_qh = min(
                         max_discharge_output_qh,
-                        max_export_qh,
+                        export_room_t,
                         max(soc_current - min_soc_mwh, 0.0) * inputs.eta_discharge,
                     )
                     if discharge_this_qh <= 1e-12:
@@ -2003,6 +2139,35 @@ def add_afrr_capacity_to_final_result(
     final["afrr_certified_capacity_up_mw_h"] = certified_up_h
     final["afrr_certified_capacity_down_mw_h"] = certified_down_h
 
+    if afrr_capacity_result is not None:
+        for _k in [
+            "wholesale_opportunity_value_eur",
+            "wholesale_expected_value_after_capture_rate_eur",
+            "raw_up_capacity_revenue_eur",
+            "expected_up_capacity_revenue_eur",
+            "raw_down_capacity_revenue_eur",
+            "expected_down_capacity_revenue_eur",
+            "expected_up_activated_mwh",
+            "expected_down_activated_mwh",
+            "afrr_up_energy_expected_value_eur",
+            "afrr_down_energy_expected_value_eur",
+            "afrr_up_total_expected_value_eur",
+            "afrr_down_total_expected_value_eur",
+            "selected_market",
+            "selected_capacity_direction",
+            "afrr_capacity_success_rate_pct",
+            "bess_wholesale_capture_rate_pct",
+            "afrr_up_activation_pct",
+            "afrr_down_activation_pct",
+            "available_export_headroom_mwh",
+            "available_soc_headroom_mwh",
+            "available_discharge_from_soc_mwh",
+            "required_up_soc_reserve_mwh",
+            "required_down_soc_headroom_mwh",
+            "expected_degradation_cost_eur",
+        ]:
+            final[_k] = np.asarray(afrr_capacity_result.get(_k, np.zeros(QH_PER_YEAR)), dtype=object if _k in ("selected_market", "selected_capacity_direction") else float)
+
     final["total_afrr_capacity_up_revenue_eur"] = np.array([cap_up_total])
     final["total_afrr_capacity_down_revenue_eur"] = np.array([cap_down_total])
     final["total_afrr_capacity_revenue_eur"] = np.array([cap_total])
@@ -2282,18 +2447,17 @@ def build_inputs_dataframe(inputs: SimulationInputs) -> pd.DataFrame:
         ("afrr_min_spread_eur_per_mwh", inputs.afrr_min_spread_eur_per_mwh),
         ("afrr_cycle_cost_eur_per_mwh", inputs.afrr_cycle_cost_eur_per_mwh),
         ("afrr_max_events_per_day", inputs.afrr_max_events_per_day),
-        ("afrr_night_start_hour", inputs.afrr_night_start_hour),
-        ("afrr_night_end_hour", inputs.afrr_night_end_hour),
+        ("afrr_night_start_hour", "removed_phase_1_all_qh_eligible"),
+        ("afrr_night_end_hour", "removed_phase_1_all_qh_eligible"),
         ("afrr_pv_zero_tolerance_mwh", inputs.afrr_pv_zero_tolerance_mwh),
         ("afrr_n_qh_per_side", inputs.afrr_n_qh_per_side),
         ("afrr_energy_down_activation_pct", inputs.afrr_energy_down_activation_pct),
         ("afrr_energy_up_activation_pct", inputs.afrr_energy_up_activation_pct),
         ("enable_afrr_capacity", inputs.enable_afrr_capacity),
         ("afrr_certified_capacity_pct", inputs.afrr_certified_capacity_pct),
-        ("afrr_capacity_start_hour", inputs.afrr_capacity_start_hour),
-        ("afrr_capacity_end_hour", inputs.afrr_capacity_end_hour),
-        ("afrr_capacity_min_price_up_eur_per_mw_h", inputs.afrr_capacity_min_price_up_eur_per_mw_h),
-        ("afrr_capacity_min_price_down_eur_per_mw_h", inputs.afrr_capacity_min_price_down_eur_per_mw_h),
+        ("afrr_capacity_success_rate_pct", inputs.afrr_capacity_success_rate_pct),
+        ("afrr_capacity_start_hour", "removed_phase_1_all_qh_eligible"),
+        ("afrr_capacity_end_hour", "removed_phase_1_all_qh_eligible"),
         ("allow_afrr_energy_without_capacity", inputs.allow_afrr_energy_without_capacity),
         ("afrr_certified_capacity_up_mw", inputs.afrr_certified_capacity_up_mw),
         ("afrr_certified_capacity_down_mw", inputs.afrr_certified_capacity_down_mw),
@@ -2352,7 +2516,7 @@ def to_excel_bytes(
 def app():
     st.set_page_config(page_title="Évaluation revenus projet hybride PV + BESS", layout="wide")
     st.title("Évaluation des revenus d'un projet hybride PV + batterie")
-    st.caption("Simulation 15 minutes (35040 pas) avec optimisation économique annuelle de la batterie + arbitrage aFRR quart-horaire de nuit.")
+    st.caption("Simulation 15 minutes (35040 pas) avec optimisation économique annuelle de la batterie + co-optimisation aFRR quart-horaire Phase 1.")
 
     with st.expander("Hypothèses structurantes", expanded=False):
         st.markdown(
@@ -2362,7 +2526,7 @@ def app():
             - Le moteur choisit la meilleure valorisation économique entre vente immédiate du PV, stockage PV et charge réseau.
             - Les **revenus de services système la nuit** sont ajoutés comme un **revenu fixe par nuit**, sans contrainte de capacité ni de SOC.
             - L'optimisation principale utilise une **programmation dynamique discrétisée sur le SOC**.
-            - Une couche séparée **aFRR quart-horaire** peut être ajoutée la nuit sans production PV.
+            - Une couche **aFRR quart-horaire Phase 1** compare wholesale, aFRR UP, aFRR DOWN et no action à chaque pas de 15 minutes.
             - La curtailment PV peut être:
               1. imposée par TSO/DSO
               2. auto-courtailment selon structure commerciale
@@ -2532,10 +2696,9 @@ def app():
     afrr_capacity_up_upload = None
     afrr_capacity_down_upload = None
     afrr_certified_capacity_pct = 100.0
-    afrr_capacity_start_hour = 20
-    afrr_capacity_end_hour = 8
-    afrr_capacity_min_price_up = 0.0
-    afrr_capacity_min_price_down = 0.0
+    afrr_capacity_start_hour = 0
+    afrr_capacity_end_hour = 0
+    afrr_capacity_success_rate_pct = 80.0
     afrr_capacity_up_source = "Upload afrr_up_capacity_price_15min_spain_2025 Excel"
     afrr_capacity_down_source = "Upload afrr_down_capacity_price_15min_spain_2025 Excel"
 
@@ -2563,22 +2726,17 @@ def app():
                 value=100.0,
                 step=1.0,
             )
-            afrr_capacity_min_price_up = st.number_input(
-                "Minimum Price for aFRR Capacity Up (€/MW/h)",
-                min_value=0.0,
-                value=10.0,
-                step=1.0,
+            afrr_capacity_success_rate_pct = st.slider(
+                "aFRR Capacity Bid Success Rate (%)",
+                min_value=0,
+                max_value=100,
+                value=80,
+                step=1,
             )
-            afrr_capacity_min_price_down = st.number_input(
-                "Minimum Price for aFRR Capacity Down (€/MW/h)",
-                min_value=0.0,
-                value=10.0,
-                step=1.0,
-            )
+            st.caption("Used only in expected-value optimization; it does not reduce physical MW/MWh dispatch.")
 
         with cap_col3:
-            afrr_capacity_start_hour = st.slider("Début aFRR Capacity", 0, 23, 20)
-            afrr_capacity_end_hour = st.slider("Fin aFRR Capacity", 0, 23, 8)
+            st.info("Phase 1: aFRR Capacity is eligible at any 15-minute timestep. Start/end hour filters were removed.")
 
     st.subheader("aFRR Energy")
     enable_afrr = st.checkbox("Activer aFRR Energy", value=False)
@@ -2622,9 +2780,8 @@ def app():
             afrr_energy_up_activation_pct = st.number_input("aFRR Energy Up Activation (%)", min_value=0.0, max_value=100.0, value=20.0, step=1.0)
 
         with c_afrr3:
-            afrr_night_start_hour = st.slider("Début nuit", 0, 23, 20)
-            afrr_night_end_hour = st.slider("Fin nuit", 0, 23, 8)
-            afrr_max_events_per_day = st.number_input("Nombre max d'événements aFRR / jour", min_value=1, value=1, step=1)
+            st.info("Phase 1: aFRR Energy is eligible at any 15-minute timestep. Night filters were removed.")
+            afrr_max_events_per_day = st.number_input("Nombre max d'événements aFRR / jour (legacy, not used in Phase 1 capacity mode)", min_value=1, value=1, step=1)
 
     st.markdown("---")
     run = st.button("Lancer la simulation", type="primary")
@@ -2943,10 +3100,9 @@ def app():
             afrr_capacity_up_price_h=afrr_capacity_up_price_h_raw,
             afrr_capacity_down_price_h=afrr_capacity_down_price_h_raw,
             afrr_certified_capacity_pct=afrr_certified_capacity_pct,
-            afrr_capacity_start_hour=int(afrr_capacity_start_hour),
-            afrr_capacity_end_hour=int(afrr_capacity_end_hour),
-            afrr_capacity_min_price_up_eur_per_mw_h=afrr_capacity_min_price_up,
-            afrr_capacity_min_price_down_eur_per_mw_h=afrr_capacity_min_price_down,
+            afrr_capacity_success_rate_pct=float(afrr_capacity_success_rate_pct),
+            afrr_capacity_start_hour=0,
+            afrr_capacity_end_hour=0,
             allow_afrr_energy_without_capacity=allow_afrr_energy_without_capacity,
             afrr_certified_capacity_up_mw=afrr_certified_capacity_up_mw,
             afrr_certified_capacity_down_mw=afrr_certified_capacity_down_mw,
@@ -2969,14 +3125,19 @@ def app():
             degraded_bess_energy_by_year_mwh=degraded_bess_energy_by_year_mwh,
         )
 
-        # aFRR Capacity is simulated before wholesale dispatch because awarded hours block
-        # the battery from wholesale charge/discharge. Capacity itself does not change SOC.
-        afrr_capacity_result = simulate_afrr_capacity(sim_inputs)
-        sim_inputs.afrr_capacity_selected_market_h = afrr_capacity_result["afrr_capacity_selected_market_h"]
-
+        # Phase 1 co-optimization flow:
+        # 1) run a baseline wholesale DP without aFRR capacity blocking,
+        # 2) select aFRR capacity by expected-value comparison against that wholesale reference,
+        # 3) rerun the final DP with selected aFRR capacity intervals blocked from wholesale dispatch.
         inputs_df = build_inputs_dataframe(sim_inputs)
 
-        with st.spinner("Optimisation économique annuelle en cours..."):
+        with st.spinner("Optimisation wholesale de référence en cours..."):
+            wholesale_reference_result = optimize_dispatch_dp(sim_inputs)
+
+        afrr_capacity_result = simulate_afrr_capacity(sim_inputs, wholesale_reference_result=wholesale_reference_result)
+        sim_inputs.afrr_capacity_selected_market_h = afrr_capacity_result["afrr_capacity_selected_market_h"]
+
+        with st.spinner("Optimisation économique annuelle finale en cours..."):
             result = optimize_dispatch_dp(sim_inputs)
 
         afrr_result = None
@@ -3278,6 +3439,29 @@ def app():
             "afrr_energy_down_activated": reconciliation["afrr_energy_down_activated_hourly"] if reconciliation is not None and "afrr_energy_down_activated_hourly" in reconciliation else np.zeros(QH_PER_YEAR),
             "afrr_energy_up_activated": reconciliation["afrr_energy_up_activated_hourly"] if reconciliation is not None and "afrr_energy_up_activated_hourly" in reconciliation else np.zeros(QH_PER_YEAR),
             "battery_blocked_by_afrr_capacity": final_result["battery_blocked_by_afrr_capacity"] if "battery_blocked_by_afrr_capacity" in final_result else np.zeros(QH_PER_YEAR, dtype=int),
+            "wholesale_opportunity_value_eur": final_result.get("wholesale_opportunity_value_eur", np.zeros(QH_PER_YEAR)),
+            "wholesale_expected_value_after_capture_rate_eur": final_result.get("wholesale_expected_value_after_capture_rate_eur", np.zeros(QH_PER_YEAR)),
+            "raw_up_capacity_revenue_eur": final_result.get("raw_up_capacity_revenue_eur", np.zeros(QH_PER_YEAR)),
+            "expected_up_capacity_revenue_eur": final_result.get("expected_up_capacity_revenue_eur", np.zeros(QH_PER_YEAR)),
+            "raw_down_capacity_revenue_eur": final_result.get("raw_down_capacity_revenue_eur", np.zeros(QH_PER_YEAR)),
+            "expected_down_capacity_revenue_eur": final_result.get("expected_down_capacity_revenue_eur", np.zeros(QH_PER_YEAR)),
+            "expected_up_activated_mwh": final_result.get("expected_up_activated_mwh", np.zeros(QH_PER_YEAR)),
+            "expected_down_activated_mwh": final_result.get("expected_down_activated_mwh", np.zeros(QH_PER_YEAR)),
+            "afrr_up_energy_expected_value_eur": final_result.get("afrr_up_energy_expected_value_eur", np.zeros(QH_PER_YEAR)),
+            "afrr_down_energy_expected_value_eur": final_result.get("afrr_down_energy_expected_value_eur", np.zeros(QH_PER_YEAR)),
+            "afrr_up_total_expected_value_eur": final_result.get("afrr_up_total_expected_value_eur", np.zeros(QH_PER_YEAR)),
+            "afrr_down_total_expected_value_eur": final_result.get("afrr_down_total_expected_value_eur", np.zeros(QH_PER_YEAR)),
+            "selected_market": final_result.get("selected_market", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "selected_capacity_direction": final_result.get("selected_capacity_direction", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "afrr_capacity_success_rate_pct": final_result.get("afrr_capacity_success_rate_pct", np.zeros(QH_PER_YEAR)),
+            "afrr_up_activation_pct": final_result.get("afrr_up_activation_pct", np.zeros(QH_PER_YEAR)),
+            "afrr_down_activation_pct": final_result.get("afrr_down_activation_pct", np.zeros(QH_PER_YEAR)),
+            "available_export_headroom_mwh": final_result.get("available_export_headroom_mwh", np.zeros(QH_PER_YEAR)),
+            "available_soc_headroom_mwh": final_result.get("available_soc_headroom_mwh", np.zeros(QH_PER_YEAR)),
+            "available_discharge_from_soc_mwh": final_result.get("available_discharge_from_soc_mwh", np.zeros(QH_PER_YEAR)),
+            "required_up_soc_reserve_mwh": final_result.get("required_up_soc_reserve_mwh", np.zeros(QH_PER_YEAR)),
+            "required_down_soc_headroom_mwh": final_result.get("required_down_soc_headroom_mwh", np.zeros(QH_PER_YEAR)),
+            "expected_degradation_cost_eur": final_result.get("expected_degradation_cost_eur", np.zeros(QH_PER_YEAR)),
             "pv_capture_rate_pct": np.full(QH_PER_YEAR, pv_capture_rate_pct),
             "bess_capture_rate_pct": np.full(QH_PER_YEAR, bess_capture_rate_pct),
         })
@@ -3338,6 +3522,29 @@ def app():
             "afrr_energy_down_activated": reconciliation["afrr_energy_down_activated_hourly"] if reconciliation is not None and "afrr_energy_down_activated_hourly" in reconciliation else np.zeros(QH_PER_YEAR),
             "afrr_energy_up_activated": reconciliation["afrr_energy_up_activated_hourly"] if reconciliation is not None and "afrr_energy_up_activated_hourly" in reconciliation else np.zeros(QH_PER_YEAR),
             "battery_blocked_by_afrr_capacity": final_result["battery_blocked_by_afrr_capacity"] if "battery_blocked_by_afrr_capacity" in final_result else np.zeros(QH_PER_YEAR, dtype=int),
+            "wholesale_opportunity_value_eur": final_result.get("wholesale_opportunity_value_eur", np.zeros(QH_PER_YEAR)),
+            "wholesale_expected_value_after_capture_rate_eur": final_result.get("wholesale_expected_value_after_capture_rate_eur", np.zeros(QH_PER_YEAR)),
+            "raw_up_capacity_revenue_eur": final_result.get("raw_up_capacity_revenue_eur", np.zeros(QH_PER_YEAR)),
+            "expected_up_capacity_revenue_eur": final_result.get("expected_up_capacity_revenue_eur", np.zeros(QH_PER_YEAR)),
+            "raw_down_capacity_revenue_eur": final_result.get("raw_down_capacity_revenue_eur", np.zeros(QH_PER_YEAR)),
+            "expected_down_capacity_revenue_eur": final_result.get("expected_down_capacity_revenue_eur", np.zeros(QH_PER_YEAR)),
+            "expected_up_activated_mwh": final_result.get("expected_up_activated_mwh", np.zeros(QH_PER_YEAR)),
+            "expected_down_activated_mwh": final_result.get("expected_down_activated_mwh", np.zeros(QH_PER_YEAR)),
+            "afrr_up_energy_expected_value_eur": final_result.get("afrr_up_energy_expected_value_eur", np.zeros(QH_PER_YEAR)),
+            "afrr_down_energy_expected_value_eur": final_result.get("afrr_down_energy_expected_value_eur", np.zeros(QH_PER_YEAR)),
+            "afrr_up_total_expected_value_eur": final_result.get("afrr_up_total_expected_value_eur", np.zeros(QH_PER_YEAR)),
+            "afrr_down_total_expected_value_eur": final_result.get("afrr_down_total_expected_value_eur", np.zeros(QH_PER_YEAR)),
+            "selected_market": final_result.get("selected_market", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "selected_capacity_direction": final_result.get("selected_capacity_direction", np.full(QH_PER_YEAR, "none", dtype=object)),
+            "afrr_capacity_success_rate_pct": final_result.get("afrr_capacity_success_rate_pct", np.zeros(QH_PER_YEAR)),
+            "afrr_up_activation_pct": final_result.get("afrr_up_activation_pct", np.zeros(QH_PER_YEAR)),
+            "afrr_down_activation_pct": final_result.get("afrr_down_activation_pct", np.zeros(QH_PER_YEAR)),
+            "available_export_headroom_mwh": final_result.get("available_export_headroom_mwh", np.zeros(QH_PER_YEAR)),
+            "available_soc_headroom_mwh": final_result.get("available_soc_headroom_mwh", np.zeros(QH_PER_YEAR)),
+            "available_discharge_from_soc_mwh": final_result.get("available_discharge_from_soc_mwh", np.zeros(QH_PER_YEAR)),
+            "required_up_soc_reserve_mwh": final_result.get("required_up_soc_reserve_mwh", np.zeros(QH_PER_YEAR)),
+            "required_down_soc_headroom_mwh": final_result.get("required_down_soc_headroom_mwh", np.zeros(QH_PER_YEAR)),
+            "expected_degradation_cost_eur": final_result.get("expected_degradation_cost_eur", np.zeros(QH_PER_YEAR)),
         })
 
         inputs_df = build_inputs_dataframe(sim_inputs)
